@@ -14,8 +14,11 @@ def parse_images_txt(images_txt_path):
             parts = line.split()
             if len(parts) < 10:
                 continue
-            # IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME
-            image_id = int(parts[0])
+            # Only process lines where first column is integer IMAGE_ID
+            try:
+                image_id = int(parts[0])
+            except ValueError:
+                continue
             qw, qx, qy, qz = map(float, parts[1:5])
             tx, ty, tz = map(float, parts[5:8])
             name = parts[9]
@@ -43,18 +46,39 @@ def camera_dir(qw, qx, qy, qz):
 
 def write_ply_camera_centers(cameras, ply_path):
     verts = []
+    colors = []
     for cam in cameras:
-        # Use the correct quaternion order and camera center formula
         C = camera_center(cam['qw'], cam['qx'], cam['qy'], cam['qz'], cam['t'])
         verts.append(C)
+        colors.append((255, 0, 0))  # Red for center
     verts = np.array(verts)
     with open(ply_path, 'w') as f:
         f.write('ply\nformat ascii 1.0\nelement vertex {}\n'.format(len(verts)))
         f.write('property float x\nproperty float y\nproperty float z\n')
         f.write('property uchar red\nproperty uchar green\nproperty uchar blue\n')
         f.write('end_header\n')
-        for v in verts:
-            f.write('{:.6f} {:.6f} {:.6f} 255 0 0\n'.format(*v))
+        for v, c in zip(verts, colors):
+            f.write('{:.6f} {:.6f} {:.6f} {} {} {}\n'.format(*v, *c))
+
+def write_ply_camera_centers_and_dirs(cameras, ply_path, dir_scale=0.5):
+    verts = []
+    colors = []
+    for cam in cameras:
+        C = camera_center(cam['qw'], cam['qx'], cam['qy'], cam['qz'], cam['t'])
+        dir_vec = camera_dir(cam['qw'], cam['qx'], cam['qy'], cam['qz'])
+        tip = C + dir_scale * dir_vec
+        verts.append(C)
+        colors.append((255, 0, 0))  # Red for center
+        verts.append(tip)
+        colors.append((0, 0, 255))  # Blue for direction tip
+    verts = np.array(verts)
+    with open(ply_path, 'w') as f:
+        f.write('ply\nformat ascii 1.0\nelement vertex {}\n'.format(len(verts)))
+        f.write('property float x\nproperty float y\nproperty float z\n')
+        f.write('property uchar red\nproperty uchar green\nproperty uchar blue\n')
+        f.write('end_header\n')
+        for v, c in zip(verts, colors):
+            f.write('{:.6f} {:.6f} {:.6f} {} {} {}\n'.format(*v, *c))
 
 def write_ply_tx_ty_tz(cameras, ply_path):
     # For debugging: output TX,TY,TZ directly as points
@@ -73,9 +97,13 @@ if __name__ == '__main__':
     parser.add_argument('--images', required=True, help='Path to images.txt')
     parser.add_argument('--out', required=True, help='Output PLY file')
     parser.add_argument('--raw-txt', action='store_true', help='Output TX,TY,TZ directly (for debugging)')
+    parser.add_argument('--with-orient', action='store_true', help='Also output orientation as direction vector (blue tip)')
+    parser.add_argument('--dir-scale', type=float, default=0.5, help='Scale for direction vector (default: 0.5)')
     args = parser.parse_args()
     cameras = parse_images_txt(args.images)
     if args.raw_txt:
         write_ply_tx_ty_tz(cameras, args.out)
+    elif args.with_orient:
+        write_ply_camera_centers_and_dirs(cameras, args.out, dir_scale=args.dir_scale)
     else:
         write_ply_camera_centers(cameras, args.out)
