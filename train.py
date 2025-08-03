@@ -141,6 +141,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss.backward()
 
+        # Apply gradient clipping to xyz if specified
+        if hasattr(opt, 'xyz_grad_clip') and opt.xyz_grad_clip > 0.0 and gaussians._xyz.requires_grad:
+            torch.nn.utils.clip_grad_norm_(gaussians._xyz, opt.xyz_grad_clip)
+
         iter_end.record()
 
         with torch.no_grad():

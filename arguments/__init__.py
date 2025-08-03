@@ -92,12 +92,13 @@ class OptimizationParams(ParamGroup):
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
-        self.densify_grad_threshold = 0.0002
+        self.densify_grad_threshold = 0.02
         self.depth_l1_weight_init = 1.0
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
         self.fix_xyz = False  # If True, xyz positions will not be optimized during training
+        self.xyz_grad_clip = 0.001  # Clip xyz gradients to this value (0.0 = no clipping)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
