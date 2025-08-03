@@ -160,8 +160,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # Densification
-            if iteration < opt.densify_until_iter:
+            # Densification (skip if xyz is fixed)
+            if iteration < opt.densify_until_iter and gaussians._xyz.requires_grad:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -172,6 +172,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+            elif iteration < opt.densify_until_iter and not gaussians._xyz.requires_grad and iteration % opt.densification_interval == 0:
+                print(f"[ITER {iteration}] Skipping densification because xyz positions are fixed")
 
             # Optimizer step
             if iteration < opt.iterations:

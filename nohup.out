@@ -1,0 +1,44 @@
+2025-08-03 13:39:46.229469: I external/local_xla/xla/tsl/cuda/cudart_stub.cc:32] Could not find cuda drivers on your machine, GPU will not be used.
+2025-08-03 13:39:46.242978: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:467] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+E0000 00:00:1754228386.264594  702601 cuda_dnn.cc:8579] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+E0000 00:00:1754228386.271079  702601 cuda_blas.cc:1407] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+W0000 00:00:1754228386.288870  702601 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+W0000 00:00:1754228386.288926  702601 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+W0000 00:00:1754228386.288932  702601 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+W0000 00:00:1754228386.288937  702601 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+2025-08-03 13:39:46.293986: I tensorflow/core/platform/cpu_feature_guard.cc:210] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: AVX2 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+usage: train.py [-h] [--sh_degree SH_DEGREE] [--source_path SOURCE_PATH]
+                [--model_path MODEL_PATH] [--images IMAGES] [--depths DEPTHS]
+                [--resolution RESOLUTION] [--white_background]
+                [--train_test_exp] [--data_device DATA_DEVICE] [--eval]
+                [--iterations ITERATIONS]
+                [--position_lr_init POSITION_LR_INIT]
+                [--position_lr_final POSITION_LR_FINAL]
+                [--position_lr_delay_mult POSITION_LR_DELAY_MULT]
+                [--position_lr_max_steps POSITION_LR_MAX_STEPS]
+                [--feature_lr FEATURE_LR] [--opacity_lr OPACITY_LR]
+                [--scaling_lr SCALING_LR] [--rotation_lr ROTATION_LR]
+                [--exposure_lr_init EXPOSURE_LR_INIT]
+                [--exposure_lr_final EXPOSURE_LR_FINAL]
+                [--exposure_lr_delay_steps EXPOSURE_LR_DELAY_STEPS]
+                [--exposure_lr_delay_mult EXPOSURE_LR_DELAY_MULT]
+                [--percent_dense PERCENT_DENSE] [--lambda_dssim LAMBDA_DSSIM]
+                [--densification_interval DENSIFICATION_INTERVAL]
+                [--opacity_reset_interval OPACITY_RESET_INTERVAL]
+                [--densify_from_iter DENSIFY_FROM_ITER]
+                [--densify_until_iter DENSIFY_UNTIL_ITER]
+                [--densify_grad_threshold DENSIFY_GRAD_THRESHOLD]
+                [--depth_l1_weight_init DEPTH_L1_WEIGHT_INIT]
+                [--depth_l1_weight_final DEPTH_L1_WEIGHT_FINAL]
+                [--random_background] [--optimizer_type OPTIMIZER_TYPE]
+                [--convert_SHs_python] [--compute_cov3D_python] [--debug]
+                [--antialiasing] [--ip IP] [--port PORT]
+                [--debug_from DEBUG_FROM] [--detect_anomaly]
+                [--test_iterations TEST_ITERATIONS [TEST_ITERATIONS ...]]
+                [--save_iterations SAVE_ITERATIONS [SAVE_ITERATIONS ...]]
+                [--quiet] [--disable_viewer]
+                [--checkpoint_iterations CHECKPOINT_ITERATIONS [CHECKPOINT_ITERATIONS ...]]
+                [--start_checkpoint START_CHECKPOINT]
+train.py: error: argument --checkpoint_iterations: expected at least one argument
