@@ -22,6 +22,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+import numpy as np
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -39,6 +40,52 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
+
+def get_visible_points_mask(points_3d, camera, margin=0.1):
+    """
+    Get visibility mask for points based on camera frustum.
+    
+    Args:
+        points_3d: (N, 3) tensor of 3D points
+        camera: Camera object with projection matrix
+        margin: Margin around frustum (fraction of image size)
+    
+    Returns:
+        visible_mask: (N,) boolean tensor indicating visible points
+    """
+    # Get camera parameters
+    R = torch.tensor(camera.R, device=points_3d.device, dtype=points_3d.dtype)
+    T = torch.tensor(camera.T, device=points_3d.device, dtype=points_3d.dtype)
+    width = camera.image_width
+    height = camera.image_height
+    FoVx = camera.FoVx
+    FoVy = camera.FoVy
+    
+    # Calculate focal lengths from FoV
+    fx = width / (2 * np.tan(FoVx / 2))
+    fy = height / (2 * np.tan(FoVy / 2))
+    cx = width / 2
+    cy = height / 2
+    
+    # Transform points to camera coordinates
+    points_cam = torch.matmul(R, points_3d.T) + T.unsqueeze(1)  # (3, N)
+    
+    # Check if points are in front of camera (positive Z)
+    in_front = points_cam[2, :] > 0
+    
+    # Project to image coordinates
+    x = points_cam[0, :] / points_cam[2, :] * fx + cx
+    y = points_cam[1, :] / points_cam[2, :] * fy + cy
+    
+    # Check if points are within image bounds (with margin)
+    margin_x = width * margin
+    margin_y = height * margin
+    in_bounds = (x >= -margin_x) & (x <= width + margin_x) & (y >= -margin_y) & (y <= height + margin_y)
+    
+    # Combine conditions
+    visible = in_front & in_bounds
+    
+    return visible
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
@@ -102,6 +149,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
         vind = viewpoint_indices.pop(rand_idx)
 
+        # Get visibility mask for optimization
+        optimize_mask = None
+        if hasattr(opt, 'optimize_visible_only') and opt.optimize_visible_only:
+            try:
+                # Get camera frustum visibility
+                camera_frustum_visible = get_visible_points_mask(gaussians.get_xyz, viewpoint_cam)
+                
+                if hasattr(opt, 'optimize_significant_only') and opt.optimize_significant_only:
+                    # We'll determine significant points after rendering
+                    optimize_mask = camera_frustum_visible
+                else:
+                    # Optimize all visible points
+                    optimize_mask = camera_frustum_visible
+                    
+                if optimize_mask is not None:
+                    # Temporarily disable gradients for non-visible points
+                    try:
+                        gaussians._xyz.requires_grad_(True)  # Ensure gradients are enabled
+                        # Ensure optimize_mask has the right shape for broadcasting
+                        if optimize_mask.shape[0] == gaussians._xyz.shape[0]:
+                            gaussians._xyz.register_hook(lambda grad: grad * optimize_mask.float().unsqueeze(1) if grad is not None else None)
+                        else:
+                            print(f"Warning: Shape mismatch in gradient masking - xyz: {gaussians._xyz.shape}, mask: {optimize_mask.shape}")
+                    except Exception as e:
+                        print(f"Warning: Error in gradient masking: {e}. Continuing without visibility filtering.")
+                        optimize_mask = None
+            except Exception as e:
+                print(f"Warning: Visibility optimization failed: {e}. Continuing without visibility filtering.")
+                if hasattr(opt, 'disable_visibility_on_error') and opt.disable_visibility_on_error:
+                    print("Disabling visibility optimization for this training run.")
+                    opt.optimize_visible_only = False
+                optimize_mask = None
+
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
@@ -141,6 +221,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss.backward()
 
+        # Determine significant points if needed
+        if hasattr(opt, 'optimize_significant_only') and opt.optimize_significant_only and optimize_mask is not None:
+            # Use opacity and contribution to loss to determine significant points
+            opacity_threshold = 0.1
+            significant_opacity = gaussians.get_opacity.squeeze() > opacity_threshold
+            
+            # Points that contribute significantly to the loss (have high gradients)
+            if viewspace_point_tensor.grad is not None:
+                grad_magnitude = torch.norm(viewspace_point_tensor.grad, dim=1)
+                grad_threshold = grad_magnitude.mean() + grad_magnitude.std()
+                significant_grad = grad_magnitude > grad_threshold
+            else:
+                significant_grad = torch.ones_like(significant_opacity)
+            
+            # Combine conditions
+            significant_mask = significant_opacity & significant_grad & optimize_mask
+            optimize_mask = significant_mask
+
         # Apply gradient clipping to xyz if specified
         if hasattr(opt, 'xyz_grad_clip') and opt.xyz_grad_clip > 0.0 and gaussians._xyz.requires_grad:
             torch.nn.utils.clip_grad_norm_(gaussians._xyz, opt.xyz_grad_clip)
@@ -168,7 +266,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.densify_until_iter and gaussians._xyz.requires_grad:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                
+                # Use visibility mask for densification if enabled
+                densify_filter = visibility_filter
+                if hasattr(opt, 'optimize_visible_only') and opt.optimize_visible_only and optimize_mask is not None:
+                    # Only densify visible points
+                    try:
+                        # Ensure tensors have compatible shapes
+                        if visibility_filter.shape == optimize_mask.shape:
+                            densify_filter = visibility_filter & optimize_mask
+                        elif visibility_filter.shape[0] == optimize_mask.shape[0]:
+                            # Reshape optimize_mask to match visibility_filter
+                            if len(visibility_filter.shape) == 2 and len(optimize_mask.shape) == 1:
+                                optimize_mask_reshaped = optimize_mask.unsqueeze(1)
+                                densify_filter = visibility_filter & optimize_mask_reshaped
+                            else:
+                                print(f"Warning: Shape mismatch - visibility_filter: {visibility_filter.shape}, optimize_mask: {optimize_mask.shape}")
+                                densify_filter = visibility_filter
+                        elif visibility_filter.shape[0] == 0:
+                            # visibility_filter is empty, skip visibility-based densification
+                            print(f"Warning: Empty visibility_filter, skipping visibility-based densification")
+                            densify_filter = visibility_filter  # Keep it empty
+                        else:
+                            print(f"Warning: Shape mismatch - visibility_filter: {visibility_filter.shape}, optimize_mask: {optimize_mask.shape}")
+                            densify_filter = visibility_filter
+                    except Exception as e:
+                        print(f"Warning: Error in visibility filtering: {e}. Using original visibility filter.")
+                        densify_filter = visibility_filter
+                
+                gaussians.add_densification_stats(viewspace_point_tensor, densify_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -190,6 +316,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
+                
+                # Clean up gradient hooks if visibility optimization was used
+                if hasattr(opt, 'optimize_visible_only') and opt.optimize_visible_only and optimize_mask is not None:
+                    # Remove any gradient hooks that were added
+                    if hasattr(gaussians._xyz, '_backward_hooks') and gaussians._xyz._backward_hooks is not None:
+                        for hook_id in list(gaussians._xyz._backward_hooks.keys()):
+                            gaussians._xyz._backward_hooks.pop(hook_id)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))

@@ -2,15 +2,19 @@ import argparse
 import json
 import csv
 import os
-
 import laspy
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+import sys
+from geo_tabulator_vis_chunk import save_basis_vectors_ply
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Convert FHF dataset to COLMAP format.")
+    parser = argparse.ArgumentParser(description="Convert FHF dataset to COLMAP format with normalization (translations and LAS points only).")
     parser.add_argument('--meta', required=True, help='Path to meta.json')
     parser.add_argument('--calib', required=True, help='Path to calibration.csv')
     parser.add_argument('--las', required=True, help='Path to annotated_ftth.las')
     parser.add_argument('--outdir', required=True, help='Output directory for COLMAP files')
+    parser.add_argument('--extrinsics-type', choices=['cam_to_world', 'world_to_cam'], default='cam_to_world', help='Type of extrinsics in meta.json: cam_to_world (default) or world_to_cam')
     return parser.parse_args()
 
 def read_calibration(calib_path):
@@ -25,166 +29,258 @@ def read_calibration(calib_path):
             fy = float(row['focal_length_px_y'])
             cx = float(row['principal_point_px_x'])
             cy = float(row['principal_point_px_y'])
-            # You may want to parse width/height elsewhere if available
             cam_params[cam_id] = {
                 'sensor_id': sensor_id,
                 'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy,
                 'model': 'PINHOLE',
-                'width': 2452, 
-                'height': 1840 
+                'width': int(row.get('width', 2452)),
+                'height': int(row.get('height', 1840))
             }
             sensor_to_camid[sensor_id] = cam_id
     return sensor_to_camid, cam_params
 
-
 def read_las_laspy(las_path):
     las = laspy.read(las_path)
+    # Vectorized operations for better performance
     xs = las.x
     ys = las.y
     zs = las.z
+    
+    # Handle color data efficiently
     try:
         rs = las.red
         gs = las.green
         bs = las.blue
     except AttributeError:
-        rs = gs = bs = [128] * len(xs)
+        rs = gs = bs = np.full(len(xs), 128, dtype=np.uint8)
+    
+    # Calculate bounds efficiently
     min_x, min_y, min_z = xs.min(), ys.min(), zs.min()
-    points = [[float(x), float(y), float(z), int(r), int(g), int(b)] for x, y, z, r, g, b in zip(xs, ys, zs, rs, gs, bs)]
-    return points, min_x, min_y, min_z
+    
+    # Stack coordinates and colors for vectorized processing
+    coords = np.column_stack([xs, ys, zs])
+    colors = np.column_stack([rs, gs, bs])
+    
+    return coords, colors, min_x, min_y, min_z
 
-def read_las_text(las_path):
-    # Always use text-based LAS/XYZRGB parser
-    points = []
-    min_x = min_y = min_z = None
-    with open(las_path) as f:
-        for line in f:
-            vals = line.strip().split()
-            if len(vals) < 6:
-                continue
-            try:
-                x, y, z = map(float, vals[:3])
-                r, g, b = map(int, vals[3:6])
-            except Exception:
-                continue
-            points.append([x, y, z, r, g, b])
-            if min_x is None or x < min_x:
-                min_x = x
-            if min_y is None or y < min_y:
-                min_y = y
-            if min_z is None or z < min_z:
-                min_z = z
-    if min_x is None or min_y is None or min_z is None:
-        min_x = min_y = min_z = 0.0
-    return points, min_x, min_y, min_z
+def fov2focal(fov, pixels):
+    """Convert field of view to focal length (same as training system)"""
+    return pixels / (2 * np.tan(fov / 2))
+
+def camera_to_training_format(cam_id, qw, qx, qy, qz, tx, ty, tz, width, height, fx, fy, colmap_cam_id, img_name):
+    """Convert camera data to the same format used in training (cameras.json)"""
+    # Convert quaternion to rotation matrix
+    rot = R.from_quat([qx, qy, qz, qw])
+    R_matrix = rot.as_matrix()
+    
+    # Create world-to-camera transform matrix
+    Rt = np.zeros((4, 4))
+    Rt[:3, :3] = R_matrix.T  # Transpose for world-to-camera
+    Rt[:3, 3] = [tx, ty, tz]
+    Rt[3, 3] = 1.0
+    
+    # Invert to get camera-to-world transform
+    W2C = np.linalg.inv(Rt)
+    pos = W2C[:3, 3]  # Camera position in world coordinates
+    rot_world = W2C[:3, :3]  # Camera rotation in world coordinates
+    
+    # Convert to degrees for FOV calculation
+    fovx = 2 * np.arctan(width / (2 * fx))
+    fovy = 2 * np.arctan(height / (2 * fy))
+    
+    return {
+        'id': cam_id,
+        'position': pos.tolist(),
+        'rotation': rot_world.tolist(),
+        'fx': fx,
+        'fy': fy,
+        'width': width,
+        'height': height,
+        'fovx': fovx,
+        'fovy': fovy,
+        'cam_id': colmap_cam_id,
+        'img_name': img_name
+    }
 
 def main():
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
+    
     # Calibration
     sensor_to_camid, cam_params = read_calibration(args.calib)
-    # LAS (use laspy for binary LAS)
-    points, min_x, min_y, min_z = read_las_laspy(args.las)
-    # Display initial LAS value ranges
-    las_xs = [p[0] for p in points]
-    las_ys = [p[1] for p in points]
-    las_zs = [p[2] for p in points]
-    print(f"LAS file initial X range: min={min(las_xs):.6f}, max={max(las_xs):.6f}")
-    print(f"LAS file initial Y range: min={min(las_ys):.6f}, max={max(las_ys):.6f}")
-    print(f"LAS file initial Z range: min={min(las_zs):.6f}, max={max(las_zs):.6f}")
-    print(f"LAS normalization min values: min_x={min_x:.6f}, min_y={min_y:.6f}, min_z={min_z:.6f}")
-
-    # Meta
-    with open(args.meta) as f:
-        meta = json.load(f)
-    # Display initial meta.json translation ranges
-    meta_tx = []
-    meta_ty = []
-    meta_tz = []
-    for img in meta['images']:
-        if 'pose' in img and 'translation' in img['pose']:
-            t = img['pose']['translation']
-            if len(t) == 3:
-                meta_tx.append(float(t[0]))
-                meta_ty.append(float(t[1]))
-                meta_tz.append(float(t[2]))
-    if meta_tx:
-        print(f"meta.json translation X range: min={min(meta_tx):.6f}, max={max(meta_tx):.6f}")
-        print(f"meta.json translation Y range: min={min(meta_ty):.6f}, max={max(meta_ty):.6f}")
-        print(f"meta.json translation Z range: min={min(meta_tz):.6f}, max={max(meta_tz):.6f}")
-
-    # First, collect normalized translations for all images
-    norm_tx, norm_ty, norm_tz = [], [], []
-    all_t_norm = []
-    for img in meta['images']:
-        if 'pose' not in img or 'translation' not in img['pose']:
-            continue
-        t = img['pose']['translation']
-        t_norm = [float(t[0]) - min_x, float(t[1]) - min_y, float(t[2]) - min_z]
-        norm_tx.append(t_norm[0])
-        norm_ty.append(t_norm[1])
-        norm_tz.append(t_norm[2])
-        all_t_norm.append(t_norm)
-    # Find offsets to make all translations non-negative
-    offset_x = -min(norm_tx) if norm_tx and min(norm_tx) < 0 else 0.0
-    offset_y = -min(norm_ty) if norm_ty and min(norm_ty) < 0 else 0.0
-    offset_z = -min(norm_tz) if norm_tz and min(norm_tz) < 0 else 0.0
-    print(f"Image translation offset to ensure non-negative: x={offset_x}, y={offset_y}, z={offset_z}")
-    # Write points3D.txt and collect normalized ranges
-    norm_xs, norm_ys, norm_zs = [], [], []
+    
+    # LAS (use laspy for binary LAS) - vectorized
+    coords, colors, min_x, min_y, min_z = read_las_laspy(args.las)
+    
+    # Normalize LAS points efficiently
+    norm_coords = coords - np.array([min_x, min_y, min_z])
+    
+    # Write points3D.txt efficiently
+    print("Writing points3D.txt...")
     with open(os.path.join(args.outdir, 'points3D.txt'), 'w') as f:
         f.write('# 3D point list with one line of data per point:\n')
         f.write('#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n')
-        for i, pt in enumerate(points):
-            x, y, z, r, g, b = pt
-            x = x - min_x + offset_x
-            y = y - min_y + offset_y
-            z = z - min_z + offset_z
-            norm_xs.append(x)
-            norm_ys.append(y)
-            norm_zs.append(z)
-            # Scale and clamp RGB to 0-255
-            r = min(max(int(r) // 256, 0), 255)
-            g = min(max(int(g) // 256, 0), 255)
-            b = min(max(int(b) // 256, 0), 255)
-            f.write(f'{i+1} {x} {y} {z} {r} {g} {b} 1.0\n')
-    print(f"points3D.txt normalized X range: min={min(norm_xs):.6f}, max={max(norm_xs):.6f}")
-    print(f"points3D.txt normalized Y range: min={min(norm_ys):.6f}, max={max(norm_ys):.6f}")
-    print(f"points3D.txt normalized Z range: min={min(norm_zs):.6f}, max={max(norm_zs):.6f}")
-
-    # Write cameras.txt
+        
+        # Process colors efficiently
+        colors_normalized = np.clip(colors // 256, 0, 255)
+        
+        for i, (coord, color) in enumerate(zip(norm_coords, colors_normalized)):
+            x, y, z = coord
+            r, g, b = color
+            f.write(f'{i+1} {x:.6f} {y:.6f} {z:.6f} {r} {g} {b} 1.0\n')
+    
+    # Write cameras.txt (intrinsics and resolution are NOT normalized)
+    print("Writing cameras.txt...")
     with open(os.path.join(args.outdir, 'cameras.txt'), 'w') as f:
         f.write('# Camera list with one line of data per camera:\n')
         f.write('#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n')
         for cam_id, params in cam_params.items():
             f.write(f'{cam_id} {params["model"]} {params["width"]} {params["height"]} {params["fx"]} {params["fy"]} {params["cx"]} {params["cy"]}\n')
-
-    # Write images.txt and collect normalized translation ranges (with offset)
-    norm_tx2, norm_ty2, norm_tz2 = [], [], []
+    
+    # Read metadata
+    with open(args.meta) as f:
+        meta = json.load(f)
+    
+    # Prepare data structures for efficient processing
+    image_data = []
+    camera_positions = []
+    
+    print("Processing camera poses...")
+    for img in meta['images']:
+        if 'pose' not in img or 'translation' not in img['pose'] or 'orientation_xyzw' not in img['pose']:
+            continue
+            
+        sensor_id = img['sensor_id']
+        if sensor_id not in sensor_to_camid:
+            continue
+            
+        cam_id = sensor_to_camid[sensor_id]
+        cam_params_dict = cam_params[cam_id]
+        
+        t = np.array(img['pose']['translation'], dtype=np.float64)
+        q = img['pose']['orientation_xyzw']
+        
+        if len(q) != 4:
+            continue
+            
+        qx, qy, qz, qw = q
+        
+        # Normalize translation
+        t_norm = t - np.array([min_x, min_y, min_z], dtype=np.float64)
+        
+        # Convert extrinsics to COLMAP convention
+        if args.extrinsics_type == 'cam_to_world':
+            # t is camera center in world coordinates
+            rot = R.from_quat([qx, qy, qz, qw])
+            rot_inv = rot.inv()
+            t_colmap = -rot_inv.apply(t_norm)
+            tx, ty, tz = t_colmap.tolist()
+            qx_c, qy_c, qz_c, qw_c = rot_inv.as_quat()
+            
+            # Store for images.txt
+            image_data.append({
+                'id': len(image_data) + 1,
+                'qw': qw_c, 'qx': qx_c, 'qy': qy_c, 'qz': qz_c,
+                'tx': tx, 'ty': ty, 'tz': tz,
+                'cam_id': cam_id,
+                'name': img["path"]
+            })
+            
+            # Store for cameraPositions.txt (training format)
+            camera_positions.append(camera_to_training_format(
+                len(camera_positions), qw_c, qx_c, qy_c, qz_c, 
+                tx, ty, tz, cam_params_dict['width'], cam_params_dict['height'],
+                cam_params_dict['fx'], cam_params_dict['fy'], cam_id, img["path"]
+            ))
+            
+        else:
+            # t is world-to-camera translation, need to compute camera center
+            rot = R.from_quat([qx, qy, qz, qw])
+            Rmat = rot.as_matrix()
+            C = -Rmat.T @ t_norm
+            tx, ty, tz = C.tolist()
+            
+            # Store for images.txt
+            image_data.append({
+                'id': len(image_data) + 1,
+                'qw': qw, 'qx': qx, 'qy': qy, 'qz': qz,
+                'tx': tx, 'ty': ty, 'tz': tz,
+                'cam_id': cam_id,
+                'name': img["path"]
+            })
+            
+            # Store for cameraPositions.txt (training format)
+            camera_positions.append(camera_to_training_format(
+                len(camera_positions), qw, qx, qy, qz, 
+                tx, ty, tz, cam_params_dict['width'], cam_params_dict['height'],
+                cam_params_dict['fx'], cam_params_dict['fy'], cam_id, img["path"]
+            ))
+    
+    # Write images.txt efficiently
+    print("Writing images.txt...")
     with open(os.path.join(args.outdir, 'images.txt'), 'w') as f:
         f.write('# Image list with two lines of data per image:\n')
         f.write('#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n')
-        image_id = 1
-        for img in meta['images']:
-            if 'pose' not in img or 'translation' not in img['pose'] or 'orientation_xyzw' not in img['pose']:
-                continue
-            sensor_id = img['sensor_id']
-            cam_id = sensor_to_camid[sensor_id]
-            t = img['pose']['translation']
-            t_norm = [float(t[0]) - min_x + offset_x, float(t[1]) - min_y + offset_y, float(t[2]) - min_z + offset_z]
-            norm_tx2.append(t_norm[0])
-            norm_ty2.append(t_norm[1])
-            norm_tz2.append(t_norm[2])
-            q = img['pose']['orientation_xyzw']
-            if len(q) != 4:
-                continue
-            # COLMAP expects qw, qx, qy, qz (Hamilton convention)
-            qx, qy, qz, qw = q
-            f.write(f'{image_id} {qw} {qx} {qy} {qz} {t_norm[0]} {t_norm[1]} {t_norm[2]} {cam_id} {img["path"]}\n\n')
-            image_id += 1
-    if norm_tx2:
-        print(f"images.txt normalized TX range: min={min(norm_tx2):.6f}, max={max(norm_tx2):.6f}")
-        print(f"images.txt normalized TY range: min={min(norm_ty2):.6f}, max={max(norm_ty2):.6f}")
-        print(f"images.txt normalized TZ range: min={min(norm_tz2):.6f}, max={max(norm_tz2):.6f}")
+        for img_data in image_data:
+            f.write(f'{img_data["id"]} {img_data["qw"]} {img_data["qx"]} {img_data["qy"]} {img_data["qz"]} {img_data["tx"]} {img_data["ty"]} {img_data["tz"]} {img_data["cam_id"]} {img_data["name"]}\n\n')
+    
+    # Write cameraPositions.txt (training format)
+    print("Writing cameraPositions.txt...")
+    with open(os.path.join(args.outdir, 'cameraPositions.txt'), 'w') as f:
+        f.write('# Camera positions in training format (same as cameras.json)\n')
+        f.write('#   IMAGE_ID, TX, TY, TZ, R11, R12, R13, R21, R22, R23, R31, R32, R33, Camera_ID, Img_NAME\n')
+        for cam in camera_positions:
+            tx, ty, tz = cam['position']
+            rot = cam['rotation']
+            f.write(f"{cam['id']} {tx:.6f} {ty:.6f} {tz:.6f} {rot[0][0]:.6f} {rot[0][1]:.6f} {rot[0][2]:.6f} {rot[1][0]:.6f} {rot[1][1]:.6f} {rot[1][2]:.6f} {rot[2][0]:.6f} {rot[2][1]:.6f} {rot[2][2]:.6f} {cam['cam_id']} {cam['img_name']}\n")
+    
+    # Write cameras.json (exact training format)
+    print("Writing cameras.json...")
+    with open(os.path.join(args.outdir, 'cameras.json'), 'w') as f:
+        json.dump(camera_positions, f, indent=2)
+    
+    # Create trajectory data for visualization
+    if camera_positions:
+        print("Creating trajectory visualization...")
+        trajectory_data = {
+            "positions": np.array([cam['position'] for cam in camera_positions]),
+            "quaternions": []
+        }
+        
+        # Convert rotation matrices back to quaternions for visualization
+        for cam in camera_positions:
+            rot_matrix = np.array(cam['rotation'])
+            # Convert rotation matrix to quaternion (xyzw format)
+            quat = R.from_matrix(rot_matrix).as_quat()
+            trajectory_data["quaternions"].append(quat)
+        
+        trajectory_data["quaternions"] = np.array(trajectory_data["quaternions"])
+        
+        # Save trajectory visualization as PLY
+        trajectory_ply_path = os.path.join(args.outdir, 'trajectory.ply')
+        save_basis_vectors_ply(trajectory_data, trajectory_ply_path, offset=0.5)
+        print(f"Trajectory visualization saved to: {trajectory_ply_path}")
+    
+    # Print summary statistics efficiently
+    print("\n=== SUMMARY ===")
+    print(f"Total points: {len(norm_coords):,}")
+    print(f"Total cameras: {len(image_data)}")
+    
+    # Calculate ranges efficiently
+    x_coords, y_coords, z_coords = norm_coords[:, 0], norm_coords[:, 1], norm_coords[:, 2]
+    print(f"\n=== POINTS3D.TXT RANGES ===")
+    print(f"X range: {x_coords.min():.6f} to {x_coords.max():.6f}")
+    print(f"Y range: {y_coords.min():.6f} to {y_coords.max():.6f}")
+    print(f"Z range: {z_coords.min():.6f} to {z_coords.max():.6f}")
+    
+    # Calculate camera position ranges
+    if camera_positions:
+        positions = np.array([cam['position'] for cam in camera_positions])
+        tx_coords, ty_coords, tz_coords = positions[:, 0], positions[:, 1], positions[:, 2]
+        print(f"\n=== CAMERA POSITIONS RANGES ===")
+        print(f"TX range: {tx_coords.min():.6f} to {tx_coords.max():.6f}")
+        print(f"TY range: {ty_coords.min():.6f} to {ty_coords.max():.6f}")
+        print(f"TZ range: {tz_coords.min():.6f} to {tz_coords.max():.6f}")
 
 if __name__ == '__main__':
     main()
