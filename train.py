@@ -69,6 +69,49 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_Ll1depth_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+
+    # Regularization setup (loss-only changes)
+    # Cache initial positions to discourage movement and to identify "new" points later (they are appended after densification)
+    initial_xyz = gaussians.get_xyz.detach().clone()
+    initial_count = initial_xyz.shape[0]
+    # Weights for additional regularizers (tune as needed)
+    lambda_scale = getattr(opt, "lambda_scale", 1)
+    lambda_move = getattr(opt, "lambda_move", 1e-1)
+    lambda_new_opacity = getattr(opt, "lambda_new_opacity", 1e-1)
+    lambda_new_attract = getattr(opt, "lambda_new_attract", 1e-1)
+    
+    # Memory-safe nearest-neighbor utility to avoid OOM with cdist on large sets
+    def _min_cdist_chunked(X, Y, x_chunk=2048, y_max=8192, return_indices=False):
+        # Optionally subsample Y to at most y_max to control memory
+        y_idx_global = None
+        if Y.shape[0] > y_max:
+            y_idx_global = torch.randperm(Y.shape[0], device=Y.device)[:y_max]
+            Y_use = Y[y_idx_global]
+        else:
+            Y_use = Y
+            if return_indices:
+                y_idx_global = torch.arange(Y.shape[0], device=Y.device)
+        mins = []
+        argmins = []
+        for i in range(0, X.shape[0], x_chunk):
+            Xi = X[i:i+x_chunk]
+            d = torch.cdist(Xi, Y_use, p=2)
+            mi, ai = torch.min(d, dim=1)
+            mins.append(mi)
+            if return_indices:
+                argmins.append(y_idx_global[ai])
+        if len(mins) == 0:
+            if return_indices:
+                return torch.empty(0, device=X.device), torch.empty(0, dtype=torch.long, device=X.device)
+            return torch.empty(0, device=X.device)
+        if return_indices:
+            return torch.cat(mins, dim=0), torch.cat(argmins, dim=0)
+        return torch.cat(mins, dim=0)
+    # Opacity hinge and reset-aware ramp
+    opacity_hinge_tau = getattr(opt, "opacity_hinge_tau", 0.05)
+    opacity_reset_ramp = getattr(opt, "opacity_reset_ramp", 500)
+    # Track last opacity reset iteration for ramping
+    last_opacity_reset_iter = 0
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
@@ -125,6 +168,83 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
+        # Additional regularizers to control point behavior and sizes (loss-only)
+        with torch.no_grad():
+            # Track if the set has grown; initial points remain at indices [0:initial_count)
+            current_count = gaussians.get_xyz.shape[0]
+            has_new_points = current_count > initial_count
+        # Schedules for regularizers
+        # Movement decay after half of training
+        if iteration <= int(0.5 * opt.iterations):
+            move_sched = 1.0
+        else:
+            frac = (iteration - 0.5 * opt.iterations) / max(1.0, 0.5 * opt.iterations)
+            move_sched = max(0.3, 1.0 - 0.7 * frac)
+        # Attraction ramps from densify_from_iter to densify_from_iter+3k (clamped)
+        ramp_start = getattr(opt, "densify_from_iter", 0)
+        ramp_end = min(ramp_start + 3_000, opt.iterations)
+        if iteration <= ramp_start:
+            attract_sched = 0.0
+        elif iteration >= ramp_end:
+            attract_sched = 1.0
+        else:
+            attract_sched = (iteration - ramp_start) / max(1, (ramp_end - ramp_start))
+        # Ramp for opacity penalty after last reset
+        steps_since_reset = max(0, iteration - last_opacity_reset_iter)
+        opacity_sched = min(1.0, steps_since_reset / max(1, opacity_reset_ramp))
+        # Brief boost for scale after reset (2x -> 1x over 400 steps)
+        scale_boost = 1.0
+        if steps_since_reset < 400:
+            scale_boost = 2.0 - (steps_since_reset / 400.0)
+
+        # 1) Penalize large Gaussians (operate on log-scales to keep gradients stable)
+        scales = gaussians.get_scaling  # positive via exp()
+        scale_penalty = (scales ** 2).mean()
+        scale_weight_eff = lambda_scale * scale_boost
+        loss = loss + scale_weight_eff * scale_penalty
+
+        # 2) Discourage movement of original points from their initial positions
+        current_xyz = gaussians.get_xyz
+        num_orig = min(initial_count, current_xyz.shape[0])
+        move_penalty = torch.tensor(0.0, device="cuda")
+        if num_orig > 0:
+            # Use 1:1 alignment with initial positions for remaining originals.
+            # Since densification appends new points at the end and pruning preserves order,
+            # the first num_orig entries correspond to surviving originals.
+            extent = getattr(scene, "cameras_extent", 1.0)
+            move_penalty = ((current_xyz[:num_orig] - initial_xyz[:num_orig]) ** 2).mean() / max(1e-8, extent * extent)
+            move_weight_eff = lambda_move * move_sched
+            loss = loss + move_weight_eff * move_penalty
+
+        # 3) Discourage creation/impact of new points by penalizing their opacity
+        new_opacity_penalty = torch.tensor(0.0, device="cuda")
+        attract_penalty = torch.tensor(0.0, device="cuda")
+        new_opacity_weight_eff = 0.0
+        attract_weight_eff = 0.0
+        if has_new_points:
+            new_xyz = current_xyz[initial_count:]
+            new_opacity = gaussians.get_opacity[initial_count:]
+            if new_opacity.numel() > 0:
+                # Hinge: penalize only above a threshold, and ramp after resets
+                new_opacity_penalty = torch.relu(new_opacity - opacity_hinge_tau).mean()
+                new_opacity_weight_eff = lambda_new_opacity * opacity_sched
+                loss = loss + new_opacity_weight_eff * new_opacity_penalty
+
+            # 4) Attract new points to older ones (nearest original point)
+            # Use cdist; for speed you can subsample originals if needed
+            # Attract new points to the current surviving originals (not the static initial set)
+            orig_xyz = current_xyz[:num_orig]
+            if orig_xyz.shape[0] > 0 and new_xyz.shape[0] > 0:
+                # Compute squared L2 distance to nearest original and softly pull toward that nearest original
+                min_dists, nn_idx = _min_cdist_chunked(new_xyz, orig_xyz, return_indices=True)
+                attract_penalty = (min_dists ** 2).mean()
+                # Optional: add a tiny alignment term to the loss that pulls toward the nearest original position
+                # This provides gradient directionality and helps convergence of the weighted term
+                nn_targets = orig_xyz[nn_idx]
+                align_penalty = ((new_xyz - nn_targets) ** 2).mean()
+                attract_weight_eff = lambda_new_attract * attract_sched
+                loss = loss + attract_weight_eff * (attract_penalty + 0.1 * align_penalty)
+
         # Depth regularization
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
@@ -155,6 +275,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
+            # Log individual regularization losses
+            if tb_writer:
+                tb_writer.add_scalar('train_loss_regs/scale_penalty_raw', scale_penalty.item(), iteration)
+                tb_writer.add_scalar('train_loss_regs/scale_penalty_weighted', (scale_weight_eff * scale_penalty).item(), iteration)
+                tb_writer.add_scalar('train_loss_regs/move_penalty_raw', move_penalty.item() if torch.is_tensor(move_penalty) else float(move_penalty), iteration)
+                tb_writer.add_scalar('train_loss_regs/move_penalty_weighted', (move_weight_eff * move_penalty).item() if torch.is_tensor(move_penalty) else float(move_weight_eff * move_penalty), iteration)
+                tb_writer.add_scalar('train_loss_regs/new_opacity_penalty_raw', new_opacity_penalty.item() if torch.is_tensor(new_opacity_penalty) else float(new_opacity_penalty), iteration)
+                tb_writer.add_scalar('train_loss_regs/new_opacity_penalty_weighted', (new_opacity_weight_eff * new_opacity_penalty).item() if torch.is_tensor(new_opacity_penalty) else float(new_opacity_weight_eff * new_opacity_penalty), iteration)
+                tb_writer.add_scalar('train_loss_regs/new_attract_penalty_raw', attract_penalty.item() if torch.is_tensor(attract_penalty) else float(attract_penalty), iteration)
+                tb_writer.add_scalar('train_loss_regs/new_attract_penalty_weighted', (attract_weight_eff * attract_penalty).item() if torch.is_tensor(attract_penalty) else float(attract_weight_eff * attract_penalty), iteration)
+                tb_writer.add_scalar('train_loss_regs/new_attract_weight_eff', attract_weight_eff, iteration)
+
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -172,6 +304,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+                    last_opacity_reset_iter = iteration
 
             # Optimizer step
             if iteration < opt.iterations:
