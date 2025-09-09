@@ -67,7 +67,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
-    
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -125,17 +124,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ssim_value = ssim(image, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-        
-        # Mahalanobis distance loss using 3D grid-based approach
+
+        # PyTorch-based Mahalanobis regularization loss
         if gaussians.initial_points3d is not None:
-            mahalanobis_squared, mahalanobis_loss = gaussians.compute_mahalanobis_loss(grid_size=5.0)  # Adjustable grid size
-            mahalanobis_weight = 0.01  # Weight for Mahalanobis loss - increase if gaussians drift too much
+            mahalanobis_squared, mahalanobis_loss = gaussians.compute_mahalanobis_regularization_loss()
             # Use squared Mahalanobis distance directly to discourage movement from initial points
-            # This penalizes gaussians that move away from their corresponding initial 3D points
-            loss += mahalanobis_weight * mahalanobis_squared
+            mahal_part = gaussians.regularization_weight * mahalanobis_squared
+            loss += mahal_part
         else:
             mahalanobis_squared = torch.tensor(0.0, device="cuda")
             mahalanobis_loss = torch.tensor(0.0, device="cuda")
+            mahal_part = torch.tensor(0.0, device="cuda")
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -159,7 +158,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
-            
 
             if iteration % 10 == 0:
                 progress_bar.set_postfix({
@@ -173,7 +171,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, mahalanobis_squared, mahalanobis_loss)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, mahalanobis_squared, mahalanobis_loss, mahal_part)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -206,7 +204,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-    
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -230,7 +227,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, mahalanobis_squared=None, mahalanobis_loss=None):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, mahalanobis_squared=None, mahalanobis_loss=None, mahal_part=None):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -239,6 +236,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_scalar('train_loss_patches/mahalanobis_squared', mahalanobis_squared.item(), iteration)
         if mahalanobis_loss is not None:
             tb_writer.add_scalar('train_loss_patches/mahalanobis_loss', mahalanobis_loss.item(), iteration)
+        if mahal_part is not None:
+            tb_writer.add_scalar('train_loss_patches/mahal_part', mahal_part.item(), iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:

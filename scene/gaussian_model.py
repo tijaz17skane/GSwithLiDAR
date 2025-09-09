@@ -22,6 +22,8 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 
+# Pure PyTorch implementation - no FAISS needed
+
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
 except:
@@ -63,8 +65,11 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
-        # Mahalanobis distance tracking
-        self.initial_points3d = None  # Store initial 3D points from points3D.txt
+        
+        # PyTorch-based regularization
+        self.initial_points3d = None  # Store initial 3D points
+        self.regularization_weight = 0.01  # Weight for Mahalanobis regularization loss
+        
         self.setup_functions()
 
     def capture(self):
@@ -158,7 +163,7 @@ class GaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        # Store initial 3D points for Mahalanobis distance calculation
+        # Store initial points for PyTorch-based regularization
         self.initial_points3d = fused_point_cloud.clone().detach()
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
@@ -367,7 +372,6 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
-        
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -411,7 +415,6 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -479,146 +482,75 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
-    def compute_mahalanobis_loss(self, grid_size=10.0):
+    def compute_mahalanobis_regularization_loss(self):
         """
-        Compute Mahalanobis distance loss using 3D grid-based approach.
-        Divides the scene into a 3D grid and computes Mahalanobis distances within each grid cell.
-        This is much more memory efficient and handles large point clouds.
+        Compute Mahalanobis distance regularization loss using pure PyTorch.
+        Uses efficient batched nearest neighbor search to avoid memory issues.
         """
         if self.initial_points3d is None:
             return torch.tensor(0.0, device="cuda"), torch.tensor(0.0, device="cuda")
         
-        current_xyz = self.get_xyz  # Shape: (N, 3)
+        current_xyz = self.get_xyz  # Shape: (N, 3) - N current gaussians
         current_scaling = self.get_scaling  # Shape: (N, 3)
-        initial_xyz = self.initial_points3d  # Shape: (M, 3)
         
-        if current_xyz.shape[0] == 0 or initial_xyz.shape[0] == 0:
+        if current_xyz.shape[0] == 0:
             return torch.tensor(0.0, device="cuda"), torch.tensor(0.0, device="cuda")
         
-        # Compute scene bounds
-        all_points = torch.cat([current_xyz, initial_xyz], dim=0)
-        min_bounds = torch.min(all_points, dim=0)[0]
-        max_bounds = torch.max(all_points, dim=0)[0]
+        # Sample a subset of initial points for efficiency
+        max_initial_points = 5000  # Reasonable limit for speed
+        if self.initial_points3d.shape[0] > max_initial_points:
+            # Randomly sample initial points
+            indices = torch.randperm(self.initial_points3d.shape[0], device="cuda")[:max_initial_points]
+            sampled_initial_points = self.initial_points3d[indices]
+        else:
+            sampled_initial_points = self.initial_points3d
         
-        # Create 3D grid
-        grid_min = min_bounds - grid_size
-        grid_max = max_bounds + grid_size
-        
-        # Compute grid dimensions
-        grid_dims = torch.ceil((grid_max - grid_min) / grid_size).long()
-        
-        # Get grid indices for gaussians and initial points
-        gaussian_grid_indices = ((current_xyz - grid_min) / grid_size).long()
-        initial_grid_indices = ((initial_xyz - grid_min) / grid_size).long()
-        
-        # Clamp indices to valid range
-        gaussian_grid_indices = torch.clamp(gaussian_grid_indices, torch.tensor(0, device="cuda"), grid_dims - 1)
-        initial_grid_indices = torch.clamp(initial_grid_indices, torch.tensor(0, device="cuda"), grid_dims - 1)
-        
-        # Convert 3D grid indices to 1D indices
-        gaussian_flat_indices = gaussian_grid_indices[:, 0] * grid_dims[1] * grid_dims[2] + \
-                               gaussian_grid_indices[:, 1] * grid_dims[2] + \
-                               gaussian_grid_indices[:, 2]
-        
-        initial_flat_indices = initial_grid_indices[:, 0] * grid_dims[1] * grid_dims[2] + \
-                              initial_grid_indices[:, 1] * grid_dims[2] + \
-                              initial_grid_indices[:, 2]
-        
-        # Process each grid cell
+        # Process in batches to avoid memory issues
+        batch_size = 2000  # Process gaussians in batches
         min_mahalanobis_squared_list = []
-        eps = 1e-8
         
-        for flat_idx in range(grid_dims[0] * grid_dims[1] * grid_dims[2]):
-            # Find gaussians in this grid cell
-            gaussian_mask = (gaussian_flat_indices == flat_idx)
-            if not gaussian_mask.any():
-                continue
-                
-            # Find initial points in this grid cell
-            initial_mask = (initial_flat_indices == flat_idx)
-            if not initial_mask.any():
-                continue
+        for i in range(0, current_xyz.shape[0], batch_size):
+            end_idx = min(i + batch_size, current_xyz.shape[0])
+            batch_xyz = current_xyz[i:end_idx]  # Shape: (batch_size, 3)
+            batch_scaling = current_scaling[i:end_idx]  # Shape: (batch_size, 3)
             
-            # Get gaussians and points in this cell
-            cell_gaussians = current_xyz[gaussian_mask]  # Shape: (N_cell, 3)
-            cell_scaling = current_scaling[gaussian_mask]  # Shape: (N_cell, 3)
-            cell_initial_points = initial_xyz[initial_mask]  # Shape: (M_cell, 3)
+            # Compute pairwise L2 distances for this batch
+            # Shape: (batch_size, sampled_points, 3)
+            diff = batch_xyz.unsqueeze(1) - sampled_initial_points.unsqueeze(0)
+            l2_distances = torch.norm(diff, dim=2)  # Shape: (batch_size, sampled_points)
             
-            N_cell = cell_gaussians.shape[0]
-            M_cell = cell_initial_points.shape[0]
+            # Find nearest initial point for each gaussian in this batch
+            min_distances, nearest_indices = torch.min(l2_distances, dim=1)  # Shape: (batch_size,)
             
-            # Compute Mahalanobis distances within this cell
-            inv_cov_diag = 1.0 / (cell_scaling ** 2 + eps)  # Shape: (N_cell, 3)
+            # Get the nearest initial points
+            nearest_initial_points = sampled_initial_points[nearest_indices]  # Shape: (batch_size, 3)
             
-            # Compute pairwise distances
-            diff = cell_gaussians.unsqueeze(1) - cell_initial_points.unsqueeze(0)  # Shape: (N_cell, M_cell, 3)
-            mahalanobis_squared = torch.sum(diff ** 2 * inv_cov_diag.unsqueeze(1), dim=2)  # Shape: (N_cell, M_cell)
+            # Compute Mahalanobis distances
+            diff = batch_xyz - nearest_initial_points  # Shape: (batch_size, 3)
             
-            # Find minimum distance for each gaussian in this cell
-            min_distances, _ = torch.min(mahalanobis_squared, dim=1)  # Shape: (N_cell,)
-            min_mahalanobis_squared_list.append(min_distances)
-        
-        if not min_mahalanobis_squared_list:
-            return torch.tensor(0.0, device="cuda"), torch.tensor(0.0, device="cuda")
+            # Add small epsilon to avoid division by zero
+            eps = 1e-8
+            inv_cov_diag = 1.0 / (batch_scaling ** 2 + eps)  # Shape: (batch_size, 3)
+            
+            # Compute squared Mahalanobis distances
+            mahalanobis_squared = torch.sum(diff ** 2 * inv_cov_diag, dim=1)  # Shape: (batch_size,)
+            min_mahalanobis_squared_list.append(mahalanobis_squared)
         
         # Concatenate all results
-        min_mahalanobis_squared = torch.cat(min_mahalanobis_squared_list, dim=0)
+        mahalanobis_squared = torch.cat(min_mahalanobis_squared_list, dim=0)  # Shape: (N,)
         
         # Compute average squared Mahalanobis distance
-        avg_mahalanobis_squared = torch.mean(min_mahalanobis_squared)
+        avg_mahalanobis_squared = torch.mean(mahalanobis_squared)
         
-        # Compute negative log likelihood
-        # We need to get the scaling for the gaussians that were processed
-        processed_gaussians_mask = torch.zeros(current_xyz.shape[0], dtype=torch.bool, device="cuda")
-        for flat_idx in range(grid_dims[0] * grid_dims[1] * grid_dims[2]):
-            gaussian_mask = (gaussian_flat_indices == flat_idx)
-            initial_mask = (initial_flat_indices == flat_idx)
-            if gaussian_mask.any() and initial_mask.any():
-                processed_gaussians_mask |= gaussian_mask
-        
-        if processed_gaussians_mask.any():
-            processed_scaling = current_scaling[processed_gaussians_mask]
-            log_det_cov = torch.sum(torch.log(processed_scaling ** 2 + eps), dim=1)
-            log_2pi = torch.log(2 * torch.pi * torch.ones_like(min_mahalanobis_squared))
-            nll = 0.5 * (min_mahalanobis_squared + log_det_cov + 3 * log_2pi)
-            avg_nll = torch.mean(nll)
-        else:
-            avg_nll = torch.tensor(0.0, device="cuda")
+        # Compute negative log likelihood for regularization
+        eps = 1e-8
+        log_det_cov = torch.sum(torch.log(current_scaling ** 2 + eps), dim=1)  # Shape: (N,)
+        log_2pi = torch.log(2 * torch.pi * torch.ones_like(mahalanobis_squared))  # Shape: (N,)
+        nll = 0.5 * (mahalanobis_squared + log_det_cov + 3 * log_2pi)  # 3D case
+        avg_nll = torch.mean(nll)
         
         return avg_mahalanobis_squared, avg_nll
 
-    def get_visible_initial_points_mask(self, camera, margin=0.1, max_points=10000):
-        """
-        Determine which initial points are visible/relevant to the current camera view.
-        Uses distance-based filtering and limits the number of points to avoid memory issues.
-        """
-        if self.initial_points3d is None:
-            return torch.tensor([], dtype=torch.bool, device="cuda")
-        
-        # Get camera parameters
-        camera_center = camera.camera_center.cuda()
-        initial_points = self.initial_points3d
-        
-        # Compute distances from camera center to initial points
-        distances = torch.norm(initial_points - camera_center.unsqueeze(0), dim=1)
-        
-        # Select points within a reasonable distance
-        # Use a more aggressive distance threshold to reduce memory usage
-        max_distance = distances.quantile(0.5)  # Use 50th percentile as max distance (more aggressive)
-        distance_mask = distances < max_distance
-        
-        # If we still have too many points, randomly sample them
-        if distance_mask.sum() > max_points:
-            # Get indices of points that pass distance filter
-            valid_indices = torch.where(distance_mask)[0]
-            # Randomly sample max_points from valid indices
-            sampled_indices = torch.randperm(valid_indices.shape[0], device="cuda")[:max_points]
-            selected_indices = valid_indices[sampled_indices]
-            
-            # Create new mask with only selected points
-            visible_mask = torch.zeros(initial_points.shape[0], dtype=torch.bool, device="cuda")
-            visible_mask[selected_indices] = True
-        else:
-            visible_mask = distance_mask
-        
-        return visible_mask
+    def set_regularization_weight(self, weight):
+        """Set the weight for the Mahalanobis regularization loss."""
+        self.regularization_weight = weight
