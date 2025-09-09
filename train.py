@@ -125,17 +125,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-        # PyTorch-based Mahalanobis regularization loss
-        if gaussians.initial_points3d is not None:
-            mahalanobis_squared, mahalanobis_loss = gaussians.compute_mahalanobis_regularization_loss()
-            # Use squared Mahalanobis distance directly to discourage movement from initial points
-            mahal_part = gaussians.regularization_weight * mahalanobis_squared
-            loss += mahal_part
-        else:
-            mahalanobis_squared = torch.tensor(0.0, device="cuda")
-            mahalanobis_loss = torch.tensor(0.0, device="cuda")
-            mahal_part = torch.tensor(0.0, device="cuda")
-
         # Depth regularization
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
@@ -160,18 +149,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({
-                    "Loss": f"{ema_loss_for_log:.{7}f}", 
-                    "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}",
-                    "Mahal Dist": f"{mahalanobis_squared.item():.{7}f}",
-                    "Mahal Loss": f"{mahalanobis_loss.item():.{7}f}"
-                })
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, mahalanobis_squared, mahalanobis_loss, mahal_part)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -227,17 +211,11 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, mahalanobis_squared=None, mahalanobis_loss=None, mahal_part=None):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
-        if mahalanobis_squared is not None:
-            tb_writer.add_scalar('train_loss_patches/mahalanobis_squared', mahalanobis_squared.item(), iteration)
-        if mahalanobis_loss is not None:
-            tb_writer.add_scalar('train_loss_patches/mahalanobis_loss', mahalanobis_loss.item(), iteration)
-        if mahal_part is not None:
-            tb_writer.add_scalar('train_loss_patches/mahal_part', mahal_part.item(), iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:

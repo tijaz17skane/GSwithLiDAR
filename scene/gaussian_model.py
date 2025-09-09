@@ -22,8 +22,6 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 
-# Pure PyTorch implementation - no FAISS needed
-
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
 except:
@@ -65,11 +63,6 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
-        
-        # PyTorch-based regularization
-        self.initial_points3d = None  # Store initial 3D points
-        self.regularization_weight = 0.01  # Weight for Mahalanobis regularization loss
-        
         self.setup_functions()
 
     def capture(self):
@@ -162,9 +155,6 @@ class GaussianModel:
         features[:, 3:, 1:] = 0.0
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
-
-        # Store initial points for PyTorch-based regularization
-        self.initial_points3d = fused_point_cloud.clone().detach()
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
@@ -481,76 +471,3 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
-
-    def compute_mahalanobis_regularization_loss(self):
-        """
-        Compute Mahalanobis distance regularization loss using pure PyTorch.
-        Uses efficient batched nearest neighbor search to avoid memory issues.
-        """
-        if self.initial_points3d is None:
-            return torch.tensor(0.0, device="cuda"), torch.tensor(0.0, device="cuda")
-        
-        current_xyz = self.get_xyz  # Shape: (N, 3) - N current gaussians
-        current_scaling = self.get_scaling  # Shape: (N, 3)
-        
-        if current_xyz.shape[0] == 0:
-            return torch.tensor(0.0, device="cuda"), torch.tensor(0.0, device="cuda")
-        
-        # Sample a subset of initial points for efficiency
-        max_initial_points = 5000  # Reasonable limit for speed
-        if self.initial_points3d.shape[0] > max_initial_points:
-            # Randomly sample initial points
-            indices = torch.randperm(self.initial_points3d.shape[0], device="cuda")[:max_initial_points]
-            sampled_initial_points = self.initial_points3d[indices]
-        else:
-            sampled_initial_points = self.initial_points3d
-        
-        # Process in batches to avoid memory issues
-        batch_size = 2000  # Process gaussians in batches
-        min_mahalanobis_squared_list = []
-        
-        for i in range(0, current_xyz.shape[0], batch_size):
-            end_idx = min(i + batch_size, current_xyz.shape[0])
-            batch_xyz = current_xyz[i:end_idx]  # Shape: (batch_size, 3)
-            batch_scaling = current_scaling[i:end_idx]  # Shape: (batch_size, 3)
-            
-            # Compute pairwise L2 distances for this batch
-            # Shape: (batch_size, sampled_points, 3)
-            diff = batch_xyz.unsqueeze(1) - sampled_initial_points.unsqueeze(0)
-            l2_distances = torch.norm(diff, dim=2)  # Shape: (batch_size, sampled_points)
-            
-            # Find nearest initial point for each gaussian in this batch
-            min_distances, nearest_indices = torch.min(l2_distances, dim=1)  # Shape: (batch_size,)
-            
-            # Get the nearest initial points
-            nearest_initial_points = sampled_initial_points[nearest_indices]  # Shape: (batch_size, 3)
-            
-            # Compute Mahalanobis distances
-            diff = batch_xyz - nearest_initial_points  # Shape: (batch_size, 3)
-            
-            # Add small epsilon to avoid division by zero
-            eps = 1e-8
-            inv_cov_diag = 1.0 / (batch_scaling ** 2 + eps)  # Shape: (batch_size, 3)
-            
-            # Compute squared Mahalanobis distances
-            mahalanobis_squared = torch.sum(diff ** 2 * inv_cov_diag, dim=1)  # Shape: (batch_size,)
-            min_mahalanobis_squared_list.append(mahalanobis_squared)
-        
-        # Concatenate all results
-        mahalanobis_squared = torch.cat(min_mahalanobis_squared_list, dim=0)  # Shape: (N,)
-        
-        # Compute average squared Mahalanobis distance
-        avg_mahalanobis_squared = torch.mean(mahalanobis_squared)
-        
-        # Compute negative log likelihood for regularization
-        eps = 1e-8
-        log_det_cov = torch.sum(torch.log(current_scaling ** 2 + eps), dim=1)  # Shape: (N,)
-        log_2pi = torch.log(2 * torch.pi * torch.ones_like(mahalanobis_squared))  # Shape: (N,)
-        nll = 0.5 * (mahalanobis_squared + log_det_cov + 3 * log_2pi)  # 3D case
-        avg_nll = torch.mean(nll)
-        
-        return avg_mahalanobis_squared, avg_nll
-
-    def set_regularization_weight(self, weight):
-        """Set the weight for the Mahalanobis regularization loss."""
-        self.regularization_weight = weight
