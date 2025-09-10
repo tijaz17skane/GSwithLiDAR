@@ -97,6 +97,9 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        self.lambda_mahalanobis = 0.1
+        self.mahalanobis_weight_init = 1.0
+        self.mahalanobis_weight_final = 0.01
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
