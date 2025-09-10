@@ -478,96 +478,8 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
-    def compute_mahalanobis_distance_loss(self, initial_points3D, batch_size=1000):
-        """
-        Compute Mahalanobis distance loss to keep Gaussians close to initial point cloud.
-        Memory-efficient implementation using batching.
-        
-        Args:
-            initial_points3D: Initial 3D points from point cloud (N, 3)
-            batch_size: Number of points to process at once (default: 1000)
-            
-        Returns:
-            Mahalanobis distance loss (scalar tensor)
-        """
-        if not hasattr(self, '_initial_points3D') or self._initial_points3D is None:
-            # Store initial points for reference
-            self._initial_points3D = initial_points3D.detach().clone()
-        
-        current_xyz = self.get_xyz  # Current Gaussian positions (M, 3)
-        current_covariances = self.get_covariance()  # Current covariances (M, 3, 3)
-        
-        # Use initial points as reference points
-        ref_points = self._initial_points3D  # (N, 3)
-        
-        # Memory-efficient implementation: process in batches
-        batch_size = min(batch_size, ref_points.shape[0])  # Don't exceed number of points
-        num_batches = (ref_points.shape[0] + batch_size - 1) // batch_size
-        
-        total_loss = 0.0
-        
-        for i in range(num_batches):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, ref_points.shape[0])
-            batch_ref_points = ref_points[start_idx:end_idx]  # (batch_size, 3)
-            
-            # Compute distances for this batch
-            batch_loss = self._compute_mahalanobis_batch(batch_ref_points, current_xyz, current_covariances)
-            total_loss += batch_loss * (end_idx - start_idx)
-        
-        # Average over all reference points
-        loss = total_loss / ref_points.shape[0]
-        
-        return loss
-    
-    def _compute_mahalanobis_batch(self, ref_points, gaussian_means, covariances):
-        """
-        Compute Mahalanobis distances for a batch of reference points.
-        
-        Args:
-            ref_points: Reference points (B, 3)
-            gaussian_means: Gaussian means (M, 3)
-            covariances: Gaussian covariances in symmetric form (M, 6)
-                        [0,0], [0,1], [0,2], [1,1], [1,2], [2,2]
-            
-        Returns:
-            Average Mahalanobis distance for this batch
-        """
-        B, M = ref_points.shape[0], gaussian_means.shape[0]
-        
-        # Compute offset vectors: (B, M, 3)
-        ref_expanded = ref_points.unsqueeze(1)  # (B, 1, 3)
-        means_expanded = gaussian_means.unsqueeze(0)  # (1, M, 3)
-        offsets = ref_expanded - means_expanded  # (B, M, 3)
-        
-        # Add regularization to diagonal elements of the covariance
-        # covariances is (M, 6) where elements are [0,0], [0,1], [0,2], [1,1], [1,2], [2,2]
-        reg_term = 1e-6
-        covariances_reg = covariances.clone()
-        covariances_reg[:, 0] += reg_term  # [0,0] diagonal
-        covariances_reg[:, 3] += reg_term  # [1,1] diagonal  
-        covariances_reg[:, 5] += reg_term  # [2,2] diagonal
-        
-        # Extract diagonal elements as variances
-        # covariances_reg[:, 0] = [0,0], covariances_reg[:, 3] = [1,1], covariances_reg[:, 5] = [2,2]
-        variances = torch.stack([
-            covariances_reg[:, 0],  # [0,0]
-            covariances_reg[:, 3],  # [1,1] 
-            covariances_reg[:, 5]   # [2,2]
-        ], dim=1)  # (M, 3)
-        
-        variances_expanded = variances.unsqueeze(0)  # (1, M, 3)
-        
-        # Compute squared Mahalanobis distances using diagonal approximation: (B, M)
-        mahalanobis_squared = torch.sum(offsets ** 2 / (variances_expanded + 1e-8), dim=-1)
-        
-        # For each reference point, keep only the smallest distance (nearest Gaussian)
-        min_distances, _ = torch.min(mahalanobis_squared, dim=1)  # (B,)
-        
-        # Return sum for this batch
-        return torch.sum(min_distances)
 
-    def compute_coverage_loss(self, initial_points3D, coverage_threshold=3.0, sigmoid_scale=1.0, batch_size=1000, use_icp=True):
+    def compute_coverage_loss(self, initial_points3D, coverage_threshold=3.0, sigmoid_scale=1.0, batch_size=1000, use_icp=True, force_icp=False, icp_batch_size=500, gaussian_batch_size=500):
         """
         Compute coverage-based loss using Mahalanobis distance.
         
@@ -582,6 +494,8 @@ class GaussianModel:
             sigmoid_scale: Scale factor for sigmoid softness (default: 1.0)
             batch_size: Number of points to process at once (default: 1000)
             use_icp: Whether to use ICP alignment (default: True)
+            force_icp: Force ICP alignment even if cached alignment exists (default: False)
+            icp_batch_size: Batch size for ICP nearest neighbor search (default: 500)
             
         Returns:
             Coverage loss (scalar tensor)
@@ -598,7 +512,12 @@ class GaussianModel:
         
         # Step 1: ICP alignment (optional)
         if use_icp and ref_points.shape[0] > 0 and current_xyz.shape[0] > 0:
-            aligned_ref_points = self._icp_align(ref_points, current_xyz)
+            # Check if we need to recompute ICP alignment
+            if force_icp or not hasattr(self, '_aligned_points3D') or self._aligned_points3D is None:
+                aligned_ref_points = self._icp_align(ref_points, current_xyz, batch_size=icp_batch_size)
+                self._aligned_points3D = aligned_ref_points.detach().clone()
+            else:
+                aligned_ref_points = self._aligned_points3D
         else:
             aligned_ref_points = ref_points
         
@@ -616,9 +535,13 @@ class GaussianModel:
             # Compute coverage for this batch
             batch_coverage = self._compute_coverage_batch(
                 batch_ref_points, current_xyz, current_covariances, 
-                coverage_threshold, sigmoid_scale
+                coverage_threshold, sigmoid_scale, gaussian_batch_size
             )
             total_coverage += batch_coverage
+            
+            # Clear intermediate tensors to free memory
+            if i % 10 == 0:  # Every 10 batches
+                torch.cuda.empty_cache()
         
         # Step 3: Convert coverage to loss (we want to maximize coverage, so minimize (1 - coverage))
         coverage_fraction = total_coverage / aligned_ref_points.shape[0]
@@ -626,15 +549,16 @@ class GaussianModel:
         
         return loss
     
-    def _icp_align(self, source_points, target_points, max_iterations=10, tolerance=1e-6):
+    def _icp_align(self, source_points, target_points, max_iterations=10, tolerance=1e-6, batch_size=1000):
         """
-        Simple ICP alignment between source and target point clouds.
+        Memory-efficient ICP alignment between source and target point clouds.
         
         Args:
             source_points: Source points (N, 3)
             target_points: Target points (M, 3)
             max_iterations: Maximum ICP iterations
             tolerance: Convergence tolerance
+            batch_size: Batch size for nearest neighbor search
             
         Returns:
             Aligned source points (N, 3)
@@ -649,10 +573,8 @@ class GaussianModel:
         aligned_points = source_points.clone()
         
         for iteration in range(max_iterations):
-            # Find nearest neighbors
-            distances = torch.cdist(aligned_points, target_points)  # (N, M)
-            _, nearest_indices = torch.min(distances, dim=1)  # (N,)
-            nearest_targets = target_points[nearest_indices]  # (N, 3)
+            # Find nearest neighbors in batches to avoid memory issues
+            nearest_targets = self._find_nearest_neighbors_batched(aligned_points, target_points, batch_size)
             
             # Compute centroids
             source_centroid = torch.mean(aligned_points, dim=0)
@@ -686,9 +608,39 @@ class GaussianModel:
         
         return aligned_points
     
-    def _compute_coverage_batch(self, ref_points, gaussian_means, covariances, threshold, sigmoid_scale):
+    def _find_nearest_neighbors_batched(self, source_points, target_points, batch_size=1000):
+        """
+        Find nearest neighbors in batches to avoid memory issues.
+        
+        Args:
+            source_points: Source points (N, 3)
+            target_points: Target points (M, 3)
+            batch_size: Batch size for processing
+            
+        Returns:
+            Nearest target points for each source point (N, 3)
+        """
+        N = source_points.shape[0]
+        nearest_targets = torch.zeros_like(source_points)
+        
+        # Process source points in batches
+        for i in range(0, N, batch_size):
+            end_idx = min(i + batch_size, N)
+            batch_source = source_points[i:end_idx]  # (batch_size, 3)
+            
+            # Compute distances for this batch
+            distances = torch.cdist(batch_source, target_points)  # (batch_size, M)
+            _, nearest_indices = torch.min(distances, dim=1)  # (batch_size,)
+            batch_nearest = target_points[nearest_indices]  # (batch_size, 3)
+            
+            nearest_targets[i:end_idx] = batch_nearest
+        
+        return nearest_targets
+    
+    def _compute_coverage_batch(self, ref_points, gaussian_means, covariances, threshold, sigmoid_scale, gaussian_batch_size=500):
         """
         Compute soft coverage for a batch of reference points.
+        Memory-efficient implementation that processes Gaussians in sub-batches.
         
         Args:
             ref_points: Reference points (B, 3)
@@ -705,10 +657,12 @@ class GaussianModel:
         if M == 0:
             return torch.tensor(0.0, device=ref_points.device)
         
-        # Compute offset vectors: (B, M, 3)
-        ref_expanded = ref_points.unsqueeze(1)  # (B, 1, 3)
-        means_expanded = gaussian_means.unsqueeze(0)  # (1, M, 3)
-        offsets = ref_expanded - means_expanded  # (B, M, 3)
+        # Process Gaussians in sub-batches to avoid memory issues
+        gaussian_batch_size = min(gaussian_batch_size, M)  # Use provided batch size
+        num_gaussian_batches = (M + gaussian_batch_size - 1) // gaussian_batch_size
+        
+        # Initialize minimum distances for each reference point
+        min_distances = torch.full((B,), float('inf'), device=ref_points.device, dtype=ref_points.dtype)
         
         # Add regularization to diagonal elements
         reg_term = 1e-6
@@ -724,13 +678,31 @@ class GaussianModel:
             covariances_reg[:, 5]   # [2,2]
         ], dim=1)  # (M, 3)
         
-        variances_expanded = variances.unsqueeze(0)  # (1, M, 3)
-        
-        # Compute squared Mahalanobis distances: (B, M)
-        mahalanobis_squared = torch.sum(offsets ** 2 / (variances_expanded + 1e-8), dim=-1)
-        
-        # For each reference point, find the minimum distance to any Gaussian
-        min_distances, _ = torch.min(mahalanobis_squared, dim=1)  # (B,)
+        # Process Gaussians in sub-batches
+        for g_i in range(num_gaussian_batches):
+            start_g = g_i * gaussian_batch_size
+            end_g = min((g_i + 1) * gaussian_batch_size, M)
+            
+            # Get sub-batch of Gaussians
+            batch_means = gaussian_means[start_g:end_g]  # (gaussian_batch_size, 3)
+            batch_variances = variances[start_g:end_g]   # (gaussian_batch_size, 3)
+            
+            # Compute offset vectors: (B, gaussian_batch_size, 3)
+            ref_expanded = ref_points.unsqueeze(1)  # (B, 1, 3)
+            means_expanded = batch_means.unsqueeze(0)  # (1, gaussian_batch_size, 3)
+            offsets = ref_expanded - means_expanded  # (B, gaussian_batch_size, 3)
+            
+            # Compute squared Mahalanobis distances: (B, gaussian_batch_size)
+            mahalanobis_squared = torch.sum(offsets ** 2 / (batch_variances.unsqueeze(0) + 1e-8), dim=-1)
+            
+            # Update minimum distances
+            batch_min_distances, _ = torch.min(mahalanobis_squared, dim=1)  # (B,)
+            min_distances = torch.min(min_distances, batch_min_distances)
+            
+            # Clear intermediate tensors
+            del offsets, mahalanobis_squared, batch_min_distances
+            if g_i % 5 == 0:  # Every 5 sub-batches
+                torch.cuda.empty_cache()
         
         # Convert distances to soft coverage using sigmoid
         # sigmoid(-scale * (distance - threshold)) gives 1 when distance < threshold, 0 when distance > threshold

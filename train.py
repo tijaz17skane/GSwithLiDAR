@@ -62,14 +62,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
-    mahalanobis_weight = get_expon_lr_func(opt.mahalanobis_weight_init, opt.mahalanobis_weight_final, max_steps=opt.iterations)
     coverage_weight = get_expon_lr_func(opt.coverage_weight_init, opt.coverage_weight_final, max_steps=opt.iterations)
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
-    ema_mahalanobis_for_log = 0.0
     ema_coverage_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
@@ -143,27 +141,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
-        # Mahalanobis distance regularization
-        Lmaha_pure = 0.0
-        if mahalanobis_weight(iteration) > 0:
-            # Use the stored initial points from the point cloud
-            Lmaha_pure = gaussians.compute_mahalanobis_distance_loss(gaussians._initial_points3D, opt.mahalanobis_batch_size)
-            Lmaha = opt.lambda_mahalanobis * mahalanobis_weight(iteration) * Lmaha_pure
-            loss += Lmaha
-            Lmaha = Lmaha.item()
-        else:
-            Lmaha = 0
-
         # Coverage-based regularization
         Lcoverage_pure = 0.0
         if coverage_weight(iteration) > 0:
+            # Only perform ICP alignment every X iterations
+            force_icp = (iteration % opt.icp_interval == 0) or (iteration == 1)
+            
+            if force_icp and opt.use_icp_alignment:
+                print(f"[ITER {iteration}] Performing ICP alignment...")
+            
             # Compute coverage loss with ICP alignment and soft coverage
             Lcoverage_pure = gaussians.compute_coverage_loss(
                 gaussians._initial_points3D, 
                 coverage_threshold=opt.coverage_threshold,
                 sigmoid_scale=opt.coverage_sigmoid_scale,
                 batch_size=opt.coverage_batch_size,
-                use_icp=opt.use_icp_alignment
+                use_icp=opt.use_icp_alignment,
+                force_icp=force_icp,
+                icp_batch_size=opt.icp_batch_size,
+                gaussian_batch_size=opt.gaussian_batch_size
             )
             Lcoverage = opt.lambda_coverage * coverage_weight(iteration) * Lcoverage_pure
             loss += Lcoverage
@@ -179,14 +175,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
-            ema_mahalanobis_for_log = 0.4 * Lmaha + 0.6 * ema_mahalanobis_for_log
             ema_coverage_for_log = 0.4 * Lcoverage + 0.6 * ema_coverage_for_log
 
             if iteration % 10 == 0:
                 progress_bar.set_postfix({
                     "Loss": f"{ema_loss_for_log:.{7}f}", 
                     "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}", 
-                    "Maha Loss": f"{ema_mahalanobis_for_log:.{7}f}",
                     "Coverage Loss": f"{ema_coverage_for_log:.{7}f}"
                 })
                 progress_bar.update(10)
@@ -194,7 +188,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, Lmaha, Lcoverage)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, Lcoverage)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -250,11 +244,10 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, Lmaha=0, Lcoverage=0):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, Lcoverage=0):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/mahalanobis_loss', Lmaha, iteration)
         tb_writer.add_scalar('train_loss_patches/coverage_loss', Lcoverage, iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
