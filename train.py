@@ -62,12 +62,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
+    mahalanobis_weight = get_expon_lr_func(opt.mahalanobis_weight_init, opt.mahalanobis_weight_final, max_steps=opt.iterations)
+    coverage_weight = get_expon_lr_func(opt.coverage_weight_init, opt.coverage_weight_final, max_steps=opt.iterations)
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
-    
+    ema_mahalanobis_for_log = 0.0
+    ema_coverage_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -125,17 +128,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ssim_value = ssim(image, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-        
-        # Mahalanobis distance loss using 3D grid-based approach
-        if gaussians.initial_points3d is not None:
-            mahalanobis_squared, mahalanobis_loss = gaussians.compute_mahalanobis_loss(grid_size=5.0)  # Adjustable grid size
-            mahalanobis_weight = 0.01  # Weight for Mahalanobis loss - increase if gaussians drift too much
-            # Use squared Mahalanobis distance directly to discourage movement from initial points
-            # This penalizes gaussians that move away from their corresponding initial 3D points
-            loss += mahalanobis_weight * mahalanobis_squared
-        else:
-            mahalanobis_squared = torch.tensor(0.0, device="cuda")
-            mahalanobis_loss = torch.tensor(0.0, device="cuda")
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -151,6 +143,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
+        # Mahalanobis distance regularization
+        Lmaha_pure = 0.0
+        if mahalanobis_weight(iteration) > 0:
+            # Use the stored initial points from the point cloud
+            Lmaha_pure = gaussians.compute_mahalanobis_distance_loss(gaussians._initial_points3D, opt.mahalanobis_batch_size)
+            Lmaha = opt.lambda_mahalanobis * mahalanobis_weight(iteration) * Lmaha_pure
+            loss += Lmaha
+            Lmaha = Lmaha.item()
+        else:
+            Lmaha = 0
+
+        # Coverage-based regularization
+        Lcoverage_pure = 0.0
+        if coverage_weight(iteration) > 0:
+            # Compute coverage loss with ICP alignment and soft coverage
+            Lcoverage_pure = gaussians.compute_coverage_loss(
+                gaussians._initial_points3D, 
+                coverage_threshold=opt.coverage_threshold,
+                sigmoid_scale=opt.coverage_sigmoid_scale,
+                batch_size=opt.coverage_batch_size,
+                use_icp=opt.use_icp_alignment
+            )
+            Lcoverage = opt.lambda_coverage * coverage_weight(iteration) * Lcoverage_pure
+            loss += Lcoverage
+            Lcoverage = Lcoverage.item()
+        else:
+            Lcoverage = 0
+
         loss.backward()
 
         iter_end.record()
@@ -159,21 +179,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
-            
+            ema_mahalanobis_for_log = 0.4 * Lmaha + 0.6 * ema_mahalanobis_for_log
+            ema_coverage_for_log = 0.4 * Lcoverage + 0.6 * ema_coverage_for_log
 
             if iteration % 10 == 0:
                 progress_bar.set_postfix({
                     "Loss": f"{ema_loss_for_log:.{7}f}", 
-                    "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}",
-                    "Mahal Dist": f"{mahalanobis_squared.item():.{7}f}",
-                    "Mahal Loss": f"{mahalanobis_loss.item():.{7}f}"
+                    "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}", 
+                    "Maha Loss": f"{ema_mahalanobis_for_log:.{7}f}",
+                    "Coverage Loss": f"{ema_coverage_for_log:.{7}f}"
                 })
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, mahalanobis_squared, mahalanobis_loss)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, Lmaha, Lcoverage)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -206,7 +227,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-    
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -230,15 +250,13 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, mahalanobis_squared=None, mahalanobis_loss=None):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, Lmaha=0, Lcoverage=0):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/mahalanobis_loss', Lmaha, iteration)
+        tb_writer.add_scalar('train_loss_patches/coverage_loss', Lcoverage, iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
-        if mahalanobis_squared is not None:
-            tb_writer.add_scalar('train_loss_patches/mahalanobis_squared', mahalanobis_squared.item(), iteration)
-        if mahalanobis_loss is not None:
-            tb_writer.add_scalar('train_loss_patches/mahalanobis_loss', mahalanobis_loss.item(), iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:

@@ -97,6 +97,17 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        self.lambda_mahalanobis = 0.1
+        self.mahalanobis_weight_init = 1.0
+        self.mahalanobis_weight_final = 0.01
+        self.mahalanobis_batch_size = 1000
+        self.lambda_coverage = 0.1
+        self.coverage_weight_init = 1.0
+        self.coverage_weight_final = 0.01
+        self.coverage_threshold = 3.0
+        self.coverage_sigmoid_scale = 1.0
+        self.coverage_batch_size = 1000
+        self.use_icp_alignment = True
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
