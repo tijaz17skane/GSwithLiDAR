@@ -10,13 +10,13 @@ from geo_tabulator_vis_chunk import save_basis_vectors_ply
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Convert FHF dataset to COLMAP format with normalization (translations and LAS points only).")
-    parser.add_argument('--meta', required=True, help='Path to meta.json')
-    parser.add_argument('--calib', required=True, help='Path to calibration.csv')
-    parser.add_argument('--las', required=True, help='Path to annotated_ftth.las')
-    parser.add_argument('--outdir', required=True, help='Output directory for COLMAP files')
-    parser.add_argument('--extrinsics-type', choices=['cam_to_world', 'world_to_cam'], default='cam_to_world', help='Type of extrinsics in meta.json: cam_to_world (default) or world_to_cam')
-    parser.add_argument('--meta_flat', required=False, help='Path to meta_flat.json (optional)')
-    parser.add_argument('--calib_flat', required=False, help='Path to calibrations_flat.csv (optional)')
+    parser.add_argument('--meta', default='/mnt/data/tijaz/data/section_3useful/metaFiltered.json', help='Path to meta.json')
+    parser.add_argument('--calib', default='/mnt/data/tijaz/data/section_3useful/calibration.csv', help='Path to calibration.csv')
+    parser.add_argument('--las', default='/mnt/data/tijaz/data/section_3useful/points3D_withbb.las', help='Path to annotated_ftth.las')
+    parser.add_argument('--outdir', default='/mnt/data/tijaz/data/section3ready/sparse/0', help='Output directory for COLMAP files')
+    parser.add_argument('--extrinsics-type', choices=['cam_to_world','world_to_cam'], default='cam_to_world', help='Type of extrinsics')
+    #parser.add_argument('--meta_flat', default='meta_flat.json', help='Path to meta_flat.json (optional)')
+    #parser.add_argument('--calib_flat', default='calibrations_flat.csv', help='Path to calibrations_flat.csv (optional)')
     return parser.parse_args()
 
 def read_calibration(calib_path):

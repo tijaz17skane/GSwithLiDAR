@@ -58,7 +58,7 @@ def main():
     parser.add_argument("--input_las", type=str, required=True, help="Path to input .las file")
     parser.add_argument("--output_las", type=str, required=True, help="Path to output .las file with bounding box")
     parser.add_argument("--offset", type=float, default=0.0, help="Bounding box expansion offset")
-    parser.add_argument("--spacing", type=float, default=1.0, help="Spacing between points on bounding box surfaces")
+    parser.add_argument("--spacing", type=float, default=0.5, help="Spacing between points on bounding box surfaces")
     args = parser.parse_args()
 
     # Load LAS file
