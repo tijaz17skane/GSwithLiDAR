@@ -63,8 +63,6 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
-        # Mahalanobis distance tracking
-        self.initial_points3d = None  # Store initial 3D points from points3D.txt
         self.setup_functions()
 
     def capture(self):
@@ -157,9 +155,9 @@ class GaussianModel:
         features[:, 3:, 1:] = 0.0
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
-
-        # Store initial 3D points for Mahalanobis distance calculation
-        self.initial_points3d = fused_point_cloud.clone().detach()
+        
+        # Store initial points for Mahalanobis distance loss
+        self._initial_points3D = fused_point_cloud.detach().clone()
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
@@ -175,6 +173,10 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        # Initialize parent mapping: each initial gaussian maps to its initial point index
+        self.parent_idx = torch.arange(self.get_xyz.shape[0], device="cuda", dtype=torch.long)
+        # Graph maintenance flag/cache
+        self._graph_dirty = False
         self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
         self.pretrained_exposures = None
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
@@ -316,6 +318,14 @@ class GaussianModel:
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
+        # Store initial points for Mahalanobis distance loss
+        self._initial_points3D = torch.tensor(xyz, dtype=torch.float, device="cuda").detach().clone()
+
+        # Initialize parent mapping when loading
+        self.parent_idx = torch.arange(self._xyz.shape[0], device="cuda", dtype=torch.long)
+        # Graph maintenance flag/cache
+        self._graph_dirty = False
+
         self.active_sh_degree = self.max_sh_degree
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -367,7 +377,11 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
-        
+        # Propagate parent mapping through pruning
+        if hasattr(self, 'parent_idx') and self.parent_idx is not None:
+            self.parent_idx = self.parent_idx[valid_points_mask]
+        # mark graph dirty so it gets refreshed after topology change
+        self._graph_dirty = True
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -391,7 +405,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_parent_idx):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -411,7 +425,11 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        
+        # Extend parent mapping
+        if hasattr(self, 'parent_idx') and self.parent_idx is not None:
+            self.parent_idx = torch.cat((self.parent_idx, new_parent_idx.to(self.parent_idx.device)))
+        # mark graph dirty so consumers can skip recompute until next topology pass fixed it
+        self._graph_dirty = True
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -434,7 +452,9 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        # Parent mapping for new points: inherit from selected points
+        base_parent = self.parent_idx[selected_pts_mask].repeat(N)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii, base_parent)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -454,7 +474,9 @@ class GaussianModel:
 
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        # Parent mapping for clones: inherit from selected points
+        base_parent = self.parent_idx[selected_pts_mask]
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, base_parent)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom
@@ -473,152 +495,239 @@ class GaussianModel:
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
 
+        # Update parent assignments and optional grouping only when topology changes
+        print(f"[graph] densify_and_prune: starting parent maintenance; gaussians={self.get_xyz.shape[0]}")
+        self.ensure_parent_assignments()
+        self.rebuild_parent_groups()
+        self._graph_dirty = False
+        print(f"[graph] densify_and_prune: maintenance done")
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
-    def compute_mahalanobis_loss(self, grid_size=10.0):
+    def ensure_parent_assignments(self, nn_batch_size: int = 2048):
         """
-        Compute Mahalanobis distance loss using 3D grid-based approach.
-        Divides the scene into a 3D grid and computes Mahalanobis distances within each grid cell.
-        This is much more memory efficient and handles large point clouds.
+        Ensure every gaussian has a valid parent assignment.
+        If any parent indices are invalid (<0), assign them to the nearest gaussian's parent.
+        If no valid gaussians exist, assign to nearest initial point.
+        Runs in small batches to be memory efficient.
         """
-        if self.initial_points3d is None:
-            return torch.tensor(0.0, device="cuda"), torch.tensor(0.0, device="cuda")
-        
-        current_xyz = self.get_xyz  # Shape: (N, 3)
-        current_scaling = self.get_scaling  # Shape: (N, 3)
-        initial_xyz = self.initial_points3d  # Shape: (M, 3)
-        
-        if current_xyz.shape[0] == 0 or initial_xyz.shape[0] == 0:
-            return torch.tensor(0.0, device="cuda"), torch.tensor(0.0, device="cuda")
-        
-        # Compute scene bounds
-        all_points = torch.cat([current_xyz, initial_xyz], dim=0)
-        min_bounds = torch.min(all_points, dim=0)[0]
-        max_bounds = torch.max(all_points, dim=0)[0]
-        
-        # Create 3D grid
-        grid_min = min_bounds - grid_size
-        grid_max = max_bounds + grid_size
-        
-        # Compute grid dimensions
-        grid_dims = torch.ceil((grid_max - grid_min) / grid_size).long()
-        
-        # Get grid indices for gaussians and initial points
-        gaussian_grid_indices = ((current_xyz - grid_min) / grid_size).long()
-        initial_grid_indices = ((initial_xyz - grid_min) / grid_size).long()
-        
-        # Clamp indices to valid range
-        gaussian_grid_indices = torch.clamp(gaussian_grid_indices, torch.tensor(0, device="cuda"), grid_dims - 1)
-        initial_grid_indices = torch.clamp(initial_grid_indices, torch.tensor(0, device="cuda"), grid_dims - 1)
-        
-        # Convert 3D grid indices to 1D indices
-        gaussian_flat_indices = gaussian_grid_indices[:, 0] * grid_dims[1] * grid_dims[2] + \
-                               gaussian_grid_indices[:, 1] * grid_dims[2] + \
-                               gaussian_grid_indices[:, 2]
-        
-        initial_flat_indices = initial_grid_indices[:, 0] * grid_dims[1] * grid_dims[2] + \
-                              initial_grid_indices[:, 1] * grid_dims[2] + \
-                              initial_grid_indices[:, 2]
-        
-        # Process each grid cell
-        min_mahalanobis_squared_list = []
-        eps = 1e-8
-        
-        for flat_idx in range(grid_dims[0] * grid_dims[1] * grid_dims[2]):
-            # Find gaussians in this grid cell
-            gaussian_mask = (gaussian_flat_indices == flat_idx)
-            if not gaussian_mask.any():
-                continue
-                
-            # Find initial points in this grid cell
-            initial_mask = (initial_flat_indices == flat_idx)
-            if not initial_mask.any():
-                continue
-            
-            # Get gaussians and points in this cell
-            cell_gaussians = current_xyz[gaussian_mask]  # Shape: (N_cell, 3)
-            cell_scaling = current_scaling[gaussian_mask]  # Shape: (N_cell, 3)
-            cell_initial_points = initial_xyz[initial_mask]  # Shape: (M_cell, 3)
-            
-            N_cell = cell_gaussians.shape[0]
-            M_cell = cell_initial_points.shape[0]
-            
-            # Compute Mahalanobis distances within this cell
-            inv_cov_diag = 1.0 / (cell_scaling ** 2 + eps)  # Shape: (N_cell, 3)
-            
-            # Compute pairwise distances
-            diff = cell_gaussians.unsqueeze(1) - cell_initial_points.unsqueeze(0)  # Shape: (N_cell, M_cell, 3)
-            mahalanobis_squared = torch.sum(diff ** 2 * inv_cov_diag.unsqueeze(1), dim=2)  # Shape: (N_cell, M_cell)
-            
-            # Find minimum distance for each gaussian in this cell
-            min_distances, _ = torch.min(mahalanobis_squared, dim=1)  # Shape: (N_cell,)
-            min_mahalanobis_squared_list.append(min_distances)
-        
-        if not min_mahalanobis_squared_list:
-            return torch.tensor(0.0, device="cuda"), torch.tensor(0.0, device="cuda")
-        
-        # Concatenate all results
-        min_mahalanobis_squared = torch.cat(min_mahalanobis_squared_list, dim=0)
-        
-        # Compute average squared Mahalanobis distance
-        avg_mahalanobis_squared = torch.mean(min_mahalanobis_squared)
-        
-        # Compute negative log likelihood
-        # We need to get the scaling for the gaussians that were processed
-        processed_gaussians_mask = torch.zeros(current_xyz.shape[0], dtype=torch.bool, device="cuda")
-        for flat_idx in range(grid_dims[0] * grid_dims[1] * grid_dims[2]):
-            gaussian_mask = (gaussian_flat_indices == flat_idx)
-            initial_mask = (initial_flat_indices == flat_idx)
-            if gaussian_mask.any() and initial_mask.any():
-                processed_gaussians_mask |= gaussian_mask
-        
-        if processed_gaussians_mask.any():
-            processed_scaling = current_scaling[processed_gaussians_mask]
-            log_det_cov = torch.sum(torch.log(processed_scaling ** 2 + eps), dim=1)
-            log_2pi = torch.log(2 * torch.pi * torch.ones_like(min_mahalanobis_squared))
-            nll = 0.5 * (min_mahalanobis_squared + log_det_cov + 3 * log_2pi)
-            avg_nll = torch.mean(nll)
-        else:
-            avg_nll = torch.tensor(0.0, device="cuda")
-        
-        return avg_mahalanobis_squared, avg_nll
+        if not hasattr(self, 'parent_idx') or self.parent_idx is None:
+            return
+        if self.parent_idx.dtype != torch.long:
+            self.parent_idx = self.parent_idx.long()
 
-    def get_visible_initial_points_mask(self, camera, margin=0.1, max_points=10000):
-        """
-        Determine which initial points are visible/relevant to the current camera view.
-        Uses distance-based filtering and limits the number of points to avoid memory issues.
-        """
-        if self.initial_points3d is None:
-            return torch.tensor([], dtype=torch.bool, device="cuda")
-        
-        # Get camera parameters
-        camera_center = camera.camera_center.cuda()
-        initial_points = self.initial_points3d
-        
-        # Compute distances from camera center to initial points
-        distances = torch.norm(initial_points - camera_center.unsqueeze(0), dim=1)
-        
-        # Select points within a reasonable distance
-        # Use a more aggressive distance threshold to reduce memory usage
-        max_distance = distances.quantile(0.5)  # Use 50th percentile as max distance (more aggressive)
-        distance_mask = distances < max_distance
-        
-        # If we still have too many points, randomly sample them
-        if distance_mask.sum() > max_points:
-            # Get indices of points that pass distance filter
-            valid_indices = torch.where(distance_mask)[0]
-            # Randomly sample max_points from valid indices
-            sampled_indices = torch.randperm(valid_indices.shape[0], device="cuda")[:max_points]
-            selected_indices = valid_indices[sampled_indices]
-            
-            # Create new mask with only selected points
-            visible_mask = torch.zeros(initial_points.shape[0], dtype=torch.bool, device="cuda")
-            visible_mask[selected_indices] = True
+        invalid = self.parent_idx < 0
+        if not torch.any(invalid):
+            print("[graph] ensure_parent_assignments: no invalid parents")
+            return
+
+        means = self.get_xyz
+        device = means.device
+        valid_idx = torch.nonzero(~invalid, as_tuple=False).squeeze(-1)
+        missing_idx = torch.nonzero(invalid, as_tuple=False).squeeze(-1)
+        print(f"[graph] ensure_parent_assignments: invalid={missing_idx.numel()} valid={valid_idx.numel()} batch={nn_batch_size}")
+        if valid_idx.numel() > 0:
+            src_means = means[valid_idx].detach()
+            src_parents = self.parent_idx[valid_idx]
+            # Assign each missing gaussian to nearest existing gaussian's parent
+            for i0 in range(0, missing_idx.numel(), nn_batch_size):
+                i1 = min(i0 + nn_batch_size, missing_idx.numel())
+                mids = missing_idx[i0:i1]
+                q = means[mids].detach()
+                d = torch.cdist(q, src_means)
+                nn_j = torch.argmin(d, dim=1)
+                self.parent_idx[mids] = src_parents[nn_j]
+                del q, d, nn_j
+                if (i0 // nn_batch_size) % 8 == 0:
+                    torch.cuda.empty_cache()
         else:
-            visible_mask = distance_mask
+            # No valid gaussians yet; assign to nearest initial point
+            init_pts = self._initial_points3D
+            for i0 in range(0, missing_idx.numel(), nn_batch_size):
+                i1 = min(i0 + nn_batch_size, missing_idx.numel())
+                mids = missing_idx[i0:i1]
+                q = means[mids].detach()
+                d = torch.cdist(q, init_pts)
+                nn_j = torch.argmin(d, dim=1)
+                self.parent_idx[mids] = nn_j
+                del q, d, nn_j
+                if (i0 // nn_batch_size) % 8 == 0:
+                    torch.cuda.empty_cache()
+            print("[graph] ensure_parent_assignments: filled via nearest initial point")
+
+    def rebuild_parent_groups(self):
+        """
+        Optional lightweight grouping cache. Keeps sorted child indices per parent
+        using argsort and bincount to enable faster per-parent passes if needed.
+        """
+        if not hasattr(self, 'parent_idx') or self.parent_idx is None:
+            self._sorted_child_idx = None
+            self._parent_idx_sorted = None
+            self._parent_offsets = None
+            return
+        parents = self.parent_idx
+        if parents.numel() == 0:
+            self._sorted_child_idx = None
+            self._parent_idx_sorted = None
+            self._parent_offsets = None
+            return
+        sorted_idx = torch.argsort(parents)
+        self._sorted_child_idx = sorted_idx
+        self._parent_idx_sorted = parents[sorted_idx]
+        counts = torch.bincount(parents, minlength=self._initial_points3D.shape[0])
+        self._parent_offsets = torch.cumsum(counts, dim=0)
+
+
+    # Coverage loss removed as requested
+
+    def compute_graph_mahalanobis_loss(self, threshold_sigma=1e-6, gaussian_batch_size=1024):
+        """
+        Graph-based Mahalanobis loss:
+        - Each gaussian carries a parent initial point index in self.parent_idx
+        - For each initial point i, gather its children gaussians G_i
+        - Compute squared Mahalanobis distance from each child gaussian mean to initial point i using that gaussian's covariance (diagonal approximation)
+        - Average per-initial-point over its children; if no children, contribute 0
+        - Return mean over all initial points
+        Memory efficient via gaussian batching.
+        """
+        assert hasattr(self, 'parent_idx') and hasattr(self, '_initial_points3D'), "parent_idx/_initial_points3D missing"
+        if self._initial_points3D is None or self.get_xyz.shape[0] == 0:
+            return torch.tensor(0.0, device="cuda")
+
+        means = self.get_xyz  # (G,3)
+        cov6 = self.get_covariance()  # (G,6)
+        parents = self.parent_idx  # (G,)
+
+        num_init = self._initial_points3D.shape[0]
+        # Accumulators per initial point
+        sum_dist = torch.zeros(num_init, device=means.device, dtype=means.dtype)
+        count = torch.zeros(num_init, device=means.device, dtype=means.dtype)
+
+        reg = threshold_sigma
+        # precompute diagonal variances per gaussian
+        # cov6: [xx, xy, xz, yy, yz, zz] → diag = [xx, yy, zz] + reg
+        var_x = cov6[:, 0] + reg
+        var_y = cov6[:, 3] + reg
+        var_z = cov6[:, 5] + reg
+
+        G = means.shape[0]
+        bs = min(gaussian_batch_size, G)
+        for g0 in range(0, G, bs):
+            g1 = min(g0 + bs, G)
+            m = means[g0:g1]               # (gs,3)
+            pid = parents[g0:g1]           # (gs,)
+            vx = var_x[g0:g1]
+            vy = var_y[g0:g1]
+            vz = var_z[g0:g1]
+
+            # gather parent initial points
+            p = self._initial_points3D[pid]  # (gs,3)
+            d = m - p  # (gs,3)
+            # squared mahalanobis with diagonal approx
+            md2 = (d[:, 0] * d[:, 0]) / vx + (d[:, 1] * d[:, 1]) / vy + (d[:, 2] * d[:, 2]) / vz
+
+            # accumulate per parent with scatter_add
+            sum_dist.scatter_add_(0, pid, md2)
+            count.scatter_add_(0, pid, torch.ones_like(md2))
+
+        # Per-initial mean; zero for entries with count==0
+        per_init_mean = torch.zeros_like(sum_dist)
+        valid = count > 0
+        per_init_mean[valid] = sum_dist[valid] / count[valid]
+        # Mean over all initial points
+        out = per_init_mean.mean()
+        #print(f"[graph] graph_maha: done, valid={int(valid.sum().item())}/{num_init}, mean={float(out.item()):.6f}")
+        return out
+    
+    def _icp_align(self, source_points, target_points, max_iterations=10, tolerance=1e-6, batch_size=1000):
+        """
+        Memory-efficient ICP alignment between source and target point clouds.
         
-        return visible_mask
+        Args:
+            source_points: Source points (N, 3)
+            target_points: Target points (M, 3)
+            max_iterations: Maximum ICP iterations
+            tolerance: Convergence tolerance
+            batch_size: Batch size for nearest neighbor search
+            
+        Returns:
+            Aligned source points (N, 3)
+        """
+        if source_points.shape[0] == 0 or target_points.shape[0] == 0:
+            return source_points
+        
+        # Start with identity transformation
+        R = torch.eye(3, device=source_points.device, dtype=source_points.dtype)
+        t = torch.zeros(3, device=source_points.device, dtype=source_points.dtype)
+        
+        aligned_points = source_points.clone()
+        
+        for iteration in range(max_iterations):
+            # Find nearest neighbors in batches to avoid memory issues
+            nearest_targets = self._find_nearest_neighbors_batched(aligned_points, target_points, batch_size)
+            
+            # Compute centroids
+            source_centroid = torch.mean(aligned_points, dim=0)
+            target_centroid = torch.mean(nearest_targets, dim=0)
+            
+            # Center the points
+            source_centered = aligned_points - source_centroid
+            target_centered = nearest_targets - target_centroid
+            
+            # Compute rotation using SVD
+            H = source_centered.T @ target_centered  # (3, 3)
+            U, _, Vt = torch.linalg.svd(H)
+            R_new = Vt.T @ U.T
+            
+            # Ensure proper rotation (det(R) = 1)
+            if torch.det(R_new) < 0:
+                Vt[-1, :] *= -1
+                R_new = Vt.T @ U.T
+            
+            # Compute translation
+            t_new = target_centroid - R_new @ source_centroid
+            
+            # Apply transformation
+            aligned_points = (R_new @ aligned_points.T).T + t_new
+            
+            # Check convergence
+            if torch.norm(R_new - R) < tolerance and torch.norm(t_new - t) < tolerance:
+                break
+            
+            R, t = R_new, t_new
+        
+        return aligned_points
+    
+    def _find_nearest_neighbors_batched(self, source_points, target_points, batch_size=1000):
+        """
+        Find nearest neighbors in batches to avoid memory issues.
+        
+        Args:
+            source_points: Source points (N, 3)
+            target_points: Target points (M, 3)
+            batch_size: Batch size for processing
+            
+        Returns:
+            Nearest target points for each source point (N, 3)
+        """
+        N = source_points.shape[0]
+        nearest_targets = torch.zeros_like(source_points)
+        
+        # Process source points in batches
+        for i in range(0, N, batch_size):
+            end_idx = min(i + batch_size, N)
+            batch_source = source_points[i:end_idx]  # (batch_size, 3)
+            
+            # Compute distances for this batch
+            distances = torch.cdist(batch_source, target_points)  # (batch_size, M)
+            _, nearest_indices = torch.min(distances, dim=1)  # (batch_size,)
+            batch_nearest = target_points[nearest_indices]  # (batch_size, 3)
+            
+            nearest_targets[i:end_idx] = batch_nearest
+        
+        return nearest_targets
+    
+    # Coverage batch helper removed
