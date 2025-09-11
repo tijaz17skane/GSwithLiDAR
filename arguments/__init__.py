@@ -97,6 +97,7 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        # removed coverage-related params
         # Graph Mahalanobis loss params
         self.lambda_graph_maha = 0.1
         self.graph_maha_weight_init = 1.0
@@ -105,6 +106,11 @@ class OptimizationParams(ParamGroup):
         self.graph_maha_batch_size = 2048
         self.graph_maha_interval = 100
         self.graph_maha_sample_fraction = 0.25
+        # Piecewise schedule for graph mahalanobis weight
+        self.graph_maha_weight_low = 0.001
+        self.graph_maha_weight_high = 10.0
+        self.graph_maha_ramp_start = 3_000
+        self.graph_maha_ramp_end = 15_000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

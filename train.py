@@ -62,7 +62,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
-    graph_maha_weight = get_expon_lr_func(opt.graph_maha_weight_init, opt.graph_maha_weight_final, max_steps=opt.iterations)
+    def graph_maha_weight_schedule(it: int):
+        if it <= opt.graph_maha_ramp_start:
+            return opt.graph_maha_weight_low
+        if it >= opt.graph_maha_ramp_end:
+            return opt.graph_maha_weight_high
+        # linear ramp
+        t = (it - opt.graph_maha_ramp_start) / max(1, (opt.graph_maha_ramp_end - opt.graph_maha_ramp_start))
+        return opt.graph_maha_weight_low * (1.0 - t) + opt.graph_maha_weight_high * t
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -143,14 +150,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Graph-based Mahalanobis loss (parent-child over initial points)
         Lgmaha_pure = 0.0
-        if graph_maha_weight(iteration) > 0 and (iteration % opt.graph_maha_interval == 0 or gaussians._graph_dirty == False):
+        gmw = graph_maha_weight_schedule(iteration)
+        if gmw > 0 and (iteration % opt.graph_maha_interval == 0 or gaussians._graph_dirty == False):
             # Optional subsampling of gaussians for speed
             # Temporarily override batch size to a subsampled number via fraction of children
             Lgmaha_pure = gaussians.compute_graph_mahalanobis_loss(
                 threshold_sigma=opt.graph_maha_diag_reg,
                 gaussian_batch_size=opt.graph_maha_batch_size
             )
-            Lgmaha = opt.lambda_graph_maha * graph_maha_weight(iteration) * Lgmaha_pure
+            Lgmaha = opt.lambda_graph_maha * gmw * Lgmaha_pure
             loss += Lgmaha
             Lgmaha = Lgmaha.item()
         else:
@@ -285,8 +293,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 7_000, 30_000, 60_0000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 7_000, 30_000, 60_0000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 7_000, 10_000, 13_000, 15_000, 30_000, 60_0000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 7_000, 10_000, 13_000, 15_000, 30_000, 60_0000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[3_000, 7_000, 15_000])
