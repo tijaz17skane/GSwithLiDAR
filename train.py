@@ -165,6 +165,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Lgmaha = 0
 
         loss.backward()
+        torch.cuda.empty_cache()
 
         iter_end.record()
 
@@ -183,6 +184,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
+            torch.cuda.empty_cache()
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, float(Lgmaha_pure) if isinstance(Lgmaha_pure, torch.Tensor) else Lgmaha_pure, float(Lgmaha) if isinstance(Lgmaha, float) else Lgmaha)
@@ -293,8 +295,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 7_000, 10_000, 13_000, 15_000, 30_000, 60_0000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 7_000, 10_000, 13_000, 15_000, 30_000, 60_0000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 5_000, 7_000, 10_000, 13_000, 15_000, 30_000, 60_0000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 5_000, 7_000, 10_000, 13_000, 15_000, 30_000, 60_0000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[3_000, 7_000, 15_000])

@@ -623,9 +623,19 @@ class GaussianModel:
             vy = var_y[g0:g1]
             vz = var_z[g0:g1]
 
+            # Filter out-of-bounds parent indices
+            valid_mask = (pid >= 0) & (pid < self._initial_points3D.shape[0])
+            if not valid_mask.any():
+                continue
+            m = m[valid_mask]
+            pid = pid[valid_mask]
+            vx = vx[valid_mask]
+            vy = vy[valid_mask]
+            vz = vz[valid_mask]
+
             # gather parent initial points
-            p = self._initial_points3D[pid]  # (gs,3)
-            d = m - p  # (gs,3)
+            p = self._initial_points3D[pid]  # (valid,3)
+            d = m - p  # (valid,3)
             # squared mahalanobis with diagonal approx
             md2 = (d[:, 0] * d[:, 0]) / vx + (d[:, 1] * d[:, 1]) / vy + (d[:, 2] * d[:, 2]) / vz
 
