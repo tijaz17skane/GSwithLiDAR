@@ -651,7 +651,64 @@ class GaussianModel:
         out = per_init_mean.mean()
         #print(f"[graph] graph_maha: done, valid={int(valid.sum().item())}/{num_init}, mean={float(out.item()):.6f}")
         return out
-    
+
+    def compute_graph_msd_loss(self, gaussian_batch_size=1024):
+        """
+        Graph-based Mean Squared Distance (MSD) loss:
+        - Each gaussian carries a parent initial point index in self.parent_idx
+        - For each initial point i, gather its children gaussians G_i
+        - Compute squared Euclidean distance from each child gaussian mean to its parent initial point
+        - Average per-initial-point over its children; if no children, contribute 0
+        - Return mean over all initial points
+        Memory efficient via gaussian batching.
+        """
+        assert hasattr(self, 'parent_idx') and hasattr(self, '_initial_points3D'), "parent_idx/_initial_points3D missing"
+        if self._initial_points3D is None or self.get_xyz.shape[0] == 0:
+            return torch.tensor(0.0, device="cuda")
+
+        means = self.get_xyz  # (G,3)
+        parents = self.parent_idx  # (G,)
+
+        num_init = self._initial_points3D.shape[0]
+        # Accumulators per initial point
+        sum_dist = torch.zeros(num_init, device=means.device, dtype=means.dtype)
+        count = torch.zeros(num_init, device=means.device, dtype=means.dtype)
+
+        G = means.shape[0]
+        bs = min(gaussian_batch_size, G)
+        for g0 in range(0, G, bs):
+            g1 = min(g0 + bs, G)
+            m = means[g0:g1]     # (gs,3)
+            pid = parents[g0:g1] # (gs,)
+
+            # Filter valid parents
+            valid_mask = (pid >= 0) & (pid < num_init)
+            if not valid_mask.any():
+                continue
+            m = m[valid_mask]
+            pid = pid[valid_mask]
+
+            # Gather parent initial points
+            p = self._initial_points3D[pid]  # (valid,3)
+
+            # Squared Euclidean distance
+            d = m - p
+            msd = (d * d).sum(dim=1)  # (valid,)
+
+            # Accumulate per parent with scatter_add
+            sum_dist.scatter_add_(0, pid, msd)
+            count.scatter_add_(0, pid, torch.ones_like(msd))
+
+        # Per-initial mean; zero for entries with count==0
+        per_init_mean = torch.zeros_like(sum_dist)
+        valid = count > 0
+        per_init_mean[valid] = sum_dist[valid] / count[valid]
+        # Mean over all initial points
+        out = per_init_mean.mean()
+        return out
+
+
+
     def _icp_align(self, source_points, target_points, max_iterations=10, tolerance=1e-6, batch_size=1000):
         """
         Memory-efficient ICP alignment between source and target point clouds.

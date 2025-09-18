@@ -149,20 +149,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = 0
 
         # Graph-based Mahalanobis loss (parent-child over initial points)
-        Lgmaha_pure = 0.0
-        gmw = graph_maha_weight_schedule(iteration)
+        gmw = graph_maha_weight_schedule(iteration)  # you can keep same scheduler
         if gmw > 0 and (iteration % opt.graph_maha_interval == 0 or gaussians._graph_dirty == False):
-            # Optional subsampling of gaussians for speed
-            # Temporarily override batch size to a subsampled number via fraction of children
-            Lgmaha_pure = gaussians.compute_graph_mahalanobis_loss(
-                threshold_sigma=opt.graph_maha_diag_reg,
+            Lgmsd_pure = gaussians.compute_graph_msd_loss(
                 gaussian_batch_size=opt.graph_maha_batch_size
             )
-            Lgmaha = opt.lambda_graph_maha * gmw * Lgmaha_pure
-            loss += Lgmaha
-            Lgmaha = Lgmaha.item()
+            Lgmsd = opt.lambda_graph_maha * gmw * Lgmsd_pure
+            loss += Lgmsd
+            Lgmsd = Lgmsd.item()
         else:
-            Lgmaha = 0
+            Lgmsd = 0
 
         loss.backward()
         torch.cuda.empty_cache()
@@ -173,7 +169,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
-            ema_graph_maha_for_log = 0.4 * Lgmaha + 0.6 * ema_graph_maha_for_log
+            ema_graph_maha_for_log = 0.4 * Lgmsd + 0.6 * ema_graph_maha_for_log
 
             if iteration % 10 == 0:
                 progress_bar.set_postfix({
@@ -186,10 +182,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
             torch.cuda.empty_cache()
 
+            num_gaussians = scene.gaussians.get_xyz.shape[0]
+
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, float(Lgmaha_pure) if isinstance(Lgmaha_pure, torch.Tensor) else Lgmaha_pure, float(Lgmaha) if isinstance(Lgmaha, float) else Lgmaha)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, float(Lgmsd_pure) if isinstance(Lgmsd_pure, torch.Tensor) else Lgmsd_pure, float(Lgmsd) if isinstance(Lgmsd, float) else Lgmsd,num_gaussians)
             if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
+                print(f"\n[ITER {iteration}] Saving Gaussians (count={num_gaussians})")
                 scene.save(iteration)
 
             # Densification
@@ -243,13 +241,14 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, Lgmaha_pure_val=0.0, Lgmaha_val=0.0):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, Lgmsd_pure_val=0.0, Lgmsd_val=0.0, num_gaussians=0):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/graph_maha_pure', Lgmaha_pure_val, iteration)
-        tb_writer.add_scalar('train_loss_patches/graph_maha', Lgmaha_val, iteration)
+        tb_writer.add_scalar('train_loss_patches/graph_maha_pure', Lgmsd_pure_val, iteration)
+        tb_writer.add_scalar('train_loss_patches/graph_maha', Lgmsd_val, iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
+        tb_writer.add_scalar('total_Gaussians', num_gaussians, iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:

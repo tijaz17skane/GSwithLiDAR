@@ -108,7 +108,7 @@ class OptimizationParams(ParamGroup):
         self.graph_maha_sample_fraction = 0.25
         # Piecewise schedule for graph mahalanobis weight
         self.graph_maha_weight_low = 0.1
-        self.graph_maha_weight_high = 1.0
+        self.graph_maha_weight_high = 10.0
         self.graph_maha_ramp_start = 3_000
         self.graph_maha_ramp_end = 7_000
         super().__init__(parser, "Optimization Parameters")
