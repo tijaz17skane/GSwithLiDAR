@@ -63,6 +63,8 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self._initial_points3D = None  # Initialize to None
+        self.parent_idx = None  # Initialize to None
         self.setup_functions()
 
     def capture(self):
@@ -79,6 +81,8 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self._initial_points3D, # New: save initial points
+            self.parent_idx # New: save parent indices
         )
     
     def restore(self, model_args, training_args):
@@ -93,11 +97,17 @@ class GaussianModel:
         xyz_gradient_accum, 
         denom,
         opt_dict, 
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale,
+        initial_points3D, # New: load initial points
+        parent_idx # New: load parent indices
+        ) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        self._initial_points3D = initial_points3D # Assign loaded initial points
+        self.parent_idx = parent_idx # Assign loaded parent indices
+        self._graph_dirty = True # Mark graph dirty to rebuild caches after restoration
 
     @property
     def get_scaling(self):
