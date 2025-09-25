@@ -194,15 +194,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # Densification
-            if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
+            # Densification and Pruning Logic
+            if iteration < opt.iterations: # General condition for densification stats
+                # Always track radii and gradients for densification and pruning decisions
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                if iteration % opt.densification_interval == 0:
+                    # Densify phase: add/split Gaussians
+                    if iteration < opt.densify_until_iter:
+                        gaussians.densify_only(opt.densify_grad_threshold, scene.cameras_extent, radii)
+                    
+                    # Prune phase: remove Gaussians based on opacity/size
+                    if iteration >= opt.prune_from_iter and iteration < opt.prune_until_iter:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        gaussians.prune_only(0.005, scene.cameras_extent, size_threshold, radii)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -251,6 +257,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/graph_maha_pure', Lgmaha_pure_val, iteration)
         tb_writer.add_scalar('train_loss_patches/graph_maha', Lgmaha_val, iteration)
+        tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     # Report test and samples of training set
@@ -284,7 +291,6 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
@@ -301,7 +307,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 5_000, 7_000, 10_000, 13_000, 15_000, 30_000, 60_0000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[3_000, 7_000, 15_000, 30_000])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[3_000, 7_000, 15_000, 30_000,40_000,50_000,60_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
