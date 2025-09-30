@@ -203,15 +203,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration % opt.densification_interval == 0:
                     # Densify phase: add/split Gaussians
                     if iteration < opt.densify_until_iter:
-                        gaussians.densify_only(opt.densify_grad_threshold, scene.cameras_extent, radii)
+                        radii = gaussians.densify_only(opt.densify_grad_threshold, scene.cameras_extent, radii)
                     
                     # Prune phase: remove Gaussians based on opacity/size
                     if iteration >= opt.prune_from_iter and iteration < opt.prune_until_iter:
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                        gaussians.prune_only(0.005, scene.cameras_extent, size_threshold, radii)
+                        radii = gaussians.prune_only(0.005, scene.cameras_extent, size_threshold, radii)
                 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+                if iteration >= opt.prune_from_iter and iteration < opt.prune_until_iter:
+                    if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                        gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -303,8 +304,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 5_000, 7_000, 10_000, 13_000, 15_000, 30_000, 60_0000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 5_000, 7_000, 10_000, 13_000, 15_000, 30_000, 60_0000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 5_000, 7_000, 10_000, 13_000, 15_000, 30_000, 40_000, 50_000, 60_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 5_000, 7_000, 10_000, 13_000, 15_000, 30_000, 40_000, 50_000, 60_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[3_000, 7_000, 15_000, 30_000,40_000,50_000,60_000])

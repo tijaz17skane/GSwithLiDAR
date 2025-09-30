@@ -371,7 +371,7 @@ class GaussianModel:
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
-    def prune_points(self, mask):
+    def _prune_points_and_return_radii(self, mask, radii_tensor):
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -386,12 +386,12 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        self.tmp_radii = self.tmp_radii[valid_points_mask]
         # Propagate parent mapping through pruning
         if hasattr(self, 'parent_idx') and self.parent_idx is not None:
             self.parent_idx = self.parent_idx[valid_points_mask]
         # mark graph dirty so it gets refreshed after topology change
         self._graph_dirty = True
+        return radii_tensor[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -415,7 +415,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_parent_idx):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_parent_idx, current_radii_tensor):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -431,7 +431,8 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
+        combined_radii = torch.cat((current_radii_tensor, new_tmp_radii))
+
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
@@ -441,7 +442,9 @@ class GaussianModel:
         # mark graph dirty so consumers can skip recompute until next topology pass fixed it
         self._graph_dirty = True
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+        return combined_radii # New: return the combined radii
+
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, current_radii=None):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -460,16 +463,18 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
-        new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+        new_tmp_radii = current_radii[selected_pts_mask].repeat(N) # Use current_radii
 
         # Parent mapping for new points: inherit from selected points
         base_parent = self.parent_idx[selected_pts_mask].repeat(N)
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii, base_parent)
+        combined_radii = self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii, base_parent, current_radii) # Pass current_radii
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
-        self.prune_points(prune_filter)
+        pruned_radii = self._prune_points_and_return_radii(prune_filter, combined_radii)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+        return pruned_radii # Return the pruned radii
+
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, current_radii):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
@@ -482,33 +487,34 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        new_tmp_radii = current_radii[selected_pts_mask]
 
         # Parent mapping for clones: inherit from selected points
         base_parent = self.parent_idx[selected_pts_mask]
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, base_parent)
+        return self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, base_parent, current_radii)
 
-    def _prune_logic(self, min_opacity, extent, max_screen_size):
+    def _prune_logic(self, min_opacity, extent, max_screen_size, current_radii):
         """
         Helper function to create the pruning mask and call prune_points.
-        Note: self.tmp_radii must be set before calling this.
         """
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-        self.prune_points(prune_mask)
+        
+        return self._prune_points_and_return_radii(prune_mask, current_radii)
 
-    def _densify_and_prune_combined(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def _densify_and_prune_combined(self, max_grad, min_opacity, extent, max_screen_size, current_radii):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        local_radii = current_radii # Manage radii locally
 
-        self._prune_logic(min_opacity, extent, max_screen_size)
+        local_radii = self.densify_and_clone(grads, max_grad, extent, local_radii)
+        local_radii = self.densify_and_split(grads, max_grad, extent, N=2, current_radii=local_radii)
+
+        local_radii = self._prune_logic(min_opacity, extent, max_screen_size, local_radii) # Pass local_radii
 
         # Update parent assignments and optional grouping only when topology changes
         print(f"[graph] densify_and_prune: starting parent maintenance; gaussians={self.get_xyz.shape[0]}")
@@ -517,26 +523,29 @@ class GaussianModel:
         self._graph_dirty = False
         print(f"[graph] densify_and_prune: maintenance done")
         torch.cuda.empty_cache()
+        return local_radii # Return the final radii after combined densification and pruning
 
-    def densify_only(self, max_grad, extent, radii):
+    def densify_only(self, max_grad, extent, current_radii):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        local_radii = current_radii # Manage radii locally
+
+        local_radii = self.densify_and_clone(grads, max_grad, extent, local_radii)
+        local_radii = self.densify_and_split(grads, max_grad, extent, N=2, current_radii=local_radii)
 
         # Graph maintenance is handled by densify_and_clone/split if parent_idx is enabled
         self._graph_dirty = False # Indicate that graph is not dirty since child calls clean it
         torch.cuda.empty_cache()
+        return local_radii # Return the updated radii
 
-    def prune_only(self, min_opacity, extent, max_screen_size, radii):
+    def prune_only(self, min_opacity, extent, max_screen_size, current_radii):
         """
         Prunes Gaussians based on opacity and screen size criteria.
         """
-        self.tmp_radii = radii
-        self._prune_logic(min_opacity, extent, max_screen_size)
-        self.tmp_radii = None # Clean up temporary radii after pruning
+        local_radii = current_radii # Manage radii locally
+
+        local_radii = self._prune_logic(min_opacity, extent, max_screen_size, local_radii)
 
         # Update parent assignments and optional grouping after topology changes
         print(f"[graph] prune_only: starting parent maintenance; gaussians={self.get_xyz.shape[0]}")
@@ -545,6 +554,7 @@ class GaussianModel:
         self._graph_dirty = False
         print(f"[graph] prune_only: maintenance done")
         torch.cuda.empty_cache()
+        return local_radii # Return the updated radii
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
@@ -782,4 +792,5 @@ class GaussianModel:
             nearest_targets[i:end_idx] = batch_nearest
         
         return nearest_targets
-  
+    
+    # Coverage batch helper removed
