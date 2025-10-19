@@ -78,6 +78,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
     ema_graph_maha_for_log = 0.0
+    ema_Lsphericity_for_log = 0.0 # New: EMA for spherical loss
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -136,6 +137,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
+        # Spherical regularization loss
+        Lsphericity_pure = 0.0
+        if opt.lambda_sphere_reg > 0:
+            Lsphericity_pure = gaussians.compute_spherical_loss()
+            Lsphericity = opt.lambda_sphere_reg * Lsphericity_pure
+            loss += Lsphericity
+            Lsphericity = Lsphericity.item()
+        else:
+            Lsphericity = 0
+
         # Depth regularization
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
@@ -176,12 +187,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
             ema_graph_maha_for_log = 0.4 * Lgmaha + 0.6 * ema_graph_maha_for_log
+            ema_Lsphericity_for_log = 0.4 * Lsphericity + 0.6 * ema_Lsphericity_for_log # New: EMA for spherical loss
 
             if iteration % 10 == 0:
                 progress_bar.set_postfix({
                     "Loss": f"{ema_loss_for_log:.{7}f}", 
                     "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}", 
-                    "Graph Maha": f"{ema_graph_maha_for_log:.{7}f}"
+                    "Graph Maha": f"{ema_graph_maha_for_log:.{7}f}",
+                    "Sphericity": f"{ema_Lsphericity_for_log:.{7}f}" # New: Add sphericity to progress bar
                 })
                 progress_bar.update(10)
             if iteration == opt.iterations:
@@ -189,7 +202,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             torch.cuda.empty_cache()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, float(Lgmaha_pure) if isinstance(Lgmaha_pure, torch.Tensor) else Lgmaha_pure, float(Lgmaha) if isinstance(Lgmaha, float) else Lgmaha)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, float(Lgmaha_pure) if isinstance(Lgmaha_pure, torch.Tensor) else Lgmaha_pure, float(Lgmaha) if isinstance(Lgmaha, float) else Lgmaha, float(Lsphericity_pure) if isinstance(Lsphericity_pure, torch.Tensor) else Lsphericity_pure, float(Lsphericity) if isinstance(Lsphericity, float) else Lsphericity)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -210,9 +223,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                         radii = gaussians.prune_only(0.005, scene.cameras_extent, size_threshold, radii)
                 
-                if iteration >= opt.prune_from_iter and iteration < opt.prune_until_iter:
-                    if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                        gaussians.reset_opacity()
+                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    print(f"[INFO] Opacity reset triggered at iteration {iteration}")
+                    gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -252,12 +265,14 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, Lgmaha_pure_val=0.0, Lgmaha_val=0.0):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, Lgmaha_pure_val=0.0, Lgmaha_val=0.0, Lsphericity_pure_val=0.0, Lsphericity_val=0.0):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/graph_maha_pure', Lgmaha_pure_val, iteration)
         tb_writer.add_scalar('train_loss_patches/graph_maha', Lgmaha_val, iteration)
+        tb_writer.add_scalar('train_loss_patches/sphericity', Lsphericity_pure_val, iteration) # New: Log pure sphericity loss
+        tb_writer.add_scalar('train_loss_patches/sphericity_weighted', Lsphericity_val, iteration) # New: Log weighted sphericity loss
         tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
@@ -304,8 +319,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 5_000, 7_000, 10_000, 13_000, 15_000, 30_000, 40_000, 50_000, 60_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 5_000, 7_000, 10_000, 13_000, 15_000, 30_000, 40_000, 50_000, 60_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 5_000, 7_000, 10_000, 13_000, 15_000, 30_000, 60_0000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 5_000, 7_000, 10_000, 13_000, 15_000, 30_000, 60_0000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[3_000, 7_000, 15_000, 30_000,40_000,50_000,60_000])

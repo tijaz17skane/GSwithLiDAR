@@ -636,6 +636,25 @@ class GaussianModel:
 
     # Coverage loss removed as requested
 
+    def compute_spherical_loss(self):
+        """
+        Computes a regularization loss to encourage Gaussians to be spherical.
+        Minimizes the variance of the log scales (sx, sy, sz).
+        """
+        scales = self._scaling # Raw scales (before activation)
+        log_scales = torch.log(self.scaling_activation(scales)) # Convert to activated scales then log
+        
+        # Calculate mean of log scales for each gaussian
+        mean_log_scales = torch.mean(log_scales, dim=1, keepdim=True)
+        
+        # Calculate squared difference from mean for each scale component
+        squared_diff = (log_scales - mean_log_scales)**2
+        
+        # Sum squared differences for each gaussian and take mean over all gaussians
+        sphericity_loss = torch.mean(torch.sum(squared_diff, dim=1))
+        
+        return sphericity_loss
+
     def compute_graph_mahalanobis_loss(self, threshold_sigma=1e-6, gaussian_batch_size=1024):
         """
         Graph-based Mahalanobis loss:
@@ -792,5 +811,3 @@ class GaussianModel:
             nearest_targets[i:end_idx] = batch_nearest
         
         return nearest_targets
-    
-    # Coverage batch helper removed
