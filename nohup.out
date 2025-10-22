@@ -1,0 +1,20 @@
+Optimizing /mnt/data/tijaz/trainingOut
+Output folder: /mnt/data/tijaz/trainingOut [19/10 20:55:26]
+Reading camera 1/24Reading camera 2/24Reading camera 3/24Reading camera 4/24Reading camera 5/24Reading camera 6/24Reading camera 7/24Reading camera 8/24Reading camera 9/24Reading camera 10/24Reading camera 11/24Reading camera 12/24Reading camera 13/24Reading camera 14/24Reading camera 15/24Reading camera 16/24Reading camera 17/24Reading camera 18/24Reading camera 19/24Reading camera 20/24Reading camera 21/24Reading camera 22/24Reading camera 23/24Reading camera 24/24 [19/10 20:55:26]
+Converting point3d.bin to .ply, will happen only the first time you open the scene. [19/10 20:55:26]
+Loading Training Cameras [19/10 20:55:26]
+[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.
+ If this is not desired, please explicitly specify '--resolution/-r' as 1 [19/10 20:55:26]
+Loading Test Cameras [19/10 20:55:29]
+Number of points at initialisation :  4399 [19/10 20:55:29]
+Training progress:   0%|          | 0/30000 [00:00<?, ?it/s]Training progress:   0%|          | 0/30000 [00:00<?, ?it/s, Loss=0.2358337, Depth Loss=0.0000000]Training progress:   0%|          | 10/30000 [00:00<27:42, 18.04it/s, Loss=0.2358337, Depth Loss=0.0000000]Training progress:   0%|          | 10/30000 [00:00<27:42, 18.04it/s, Loss=0.2812500, Depth Loss=0.0000000]Training progress:   0%|          | 20/30000 [00:00<20:56, 23.85it/s, Loss=0.2812500, Depth Loss=0.0000000]Training progress:   0%|          | 20/30000 [00:01<20:56, 23.85it/s, Loss=0.2577905, Depth Loss=0.0000000]Training progress:   0%|          | 30/30000 [00:01<18:20, 27.22it/s, Loss=0.2577905, Depth Loss=0.0000000]Training progress:   0%|          | 30/30000 [00:01<18:20, 27.22it/s, Loss=0.2451920, Depth Loss=0.0000000]Training progress:   0%|          | 40/30000 [00:01<17:52, 27.92it/s, Loss=0.2451920, Depth Loss=0.0000000]Traceback (most recent call last):
+  File "/mnt/data/tijaz/gaussian-splatting/train.py", line 421, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+  File "/mnt/data/tijaz/gaussian-splatting/train.py", line 222, in training
+    loss.backward()
+  File "/mnt/data/tijaz/venv39/lib/python3.9/site-packages/torch/_tensor.py", line 522, in backward
+    torch.autograd.backward(
+  File "/mnt/data/tijaz/venv39/lib/python3.9/site-packages/torch/autograd/__init__.py", line 266, in backward
+    Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+KeyboardInterrupt
+Training progress:   0%|          | 40/30000 [00:01<20:22, 24.50it/s, Loss=0.2451920, Depth Loss=0.0000000]
