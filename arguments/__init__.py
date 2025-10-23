@@ -91,7 +91,7 @@ class OptimizationParams(ParamGroup):
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
-        self.densify_until_iter = 30_000
+        self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
         self.depth_l1_weight_init = 1.0
         self.depth_l1_weight_final = 0.01
@@ -99,7 +99,7 @@ class OptimizationParams(ParamGroup):
         self.optimizer_type = "default"
         # removed coverage-related params
         # Graph Mahalanobis loss params
-        self.lambda_graph_maha = 1.0
+        self.lambda_graph_maha = 0.0
         self.graph_maha_weight_init = 1.0
         self.graph_maha_weight_final = 1.0
         self.graph_maha_diag_reg = 1e-6
@@ -107,8 +107,8 @@ class OptimizationParams(ParamGroup):
         self.graph_maha_interval = 100
         self.graph_maha_sample_fraction = 0.25
         # Piecewise schedule for graph mahalanobis weight
-        self.graph_maha_weight_low = 0.1
-        self.graph_maha_weight_high = 1.0
+        self.graph_maha_weight_low = 0.0
+        self.graph_maha_weight_high = 0.0
         self.graph_maha_ramp_start = 3_000
         self.graph_maha_ramp_end = 7_000
         self.prune_from_iter = self.densify_from_iter 
