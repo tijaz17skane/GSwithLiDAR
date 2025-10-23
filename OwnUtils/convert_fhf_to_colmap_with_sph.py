@@ -83,8 +83,8 @@ def camera_to_training_format(cam_id, qw, qx, qy, qz, tx, ty, tz, width, height,
     
     # Invert to get camera-to-world transform
     W2C = np.linalg.inv(Rt)
-    pos = W2C[:3, 3]  # Camera position in world coordinates
-    rot_world = W2C[:3, :3]  # Camera rotation in world coordinates
+    pos = W2C[:3, 3]  # Camera position in camera coordinates
+    rot_world = W2C[:3, :3]  # Camera rotation in camera coordinates
     
     # Convert to degrees for FOV calculation
     fovx = 2 * np.arctan(width / (2 * fx))
