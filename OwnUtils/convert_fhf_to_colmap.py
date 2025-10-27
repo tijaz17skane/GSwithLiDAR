@@ -10,11 +10,12 @@ from geo_tabulator_vis_chunk import save_basis_vectors_ply
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Convert FHF dataset to COLMAP format with normalization (translations and LAS points only).")
-    parser.add_argument('--meta', required=True, help='Path to meta.json')
-    parser.add_argument('--calib', required=True, help='Path to calibration.csv')
-    parser.add_argument('--las', required=True, help='Path to annotated_ftth.las')
-    parser.add_argument('--outdir', required=True, help='Output directory for COLMAP files')
-    parser.add_argument('--extrinsics-type', choices=['cam_to_world', 'world_to_cam'], default='cam_to_world', help='Type of extrinsics in meta.json: cam_to_world (default) or world_to_cam')
+    parser.add_argument('--meta', default='/mnt/data/tijaz/data/section_3useful/metaFiltered.json', help='Path to meta.json')
+    parser.add_argument('--calib', default='/mnt/data/tijaz/data/section_3useful/calibration.csv', help='Path to calibration.csv')
+    parser.add_argument('--las', default='/mnt/data/tijaz/data/section3readyDownSampTo5k/downSamp.las', help='Path to annotated_ftth.las')
+    parser.add_argument('--outdir', default='/mnt/data/tijaz/data/section3readyDownSampTo5k/sparse/0', help='Output directory for COLMAP files')
+    parser.add_argument('--extrinsics-type', choices=['cam_to_world','world_to_cam'], default='cam_to_world', help='Type of extrinsics') # cam to world means camera coordinates, images.txt needs to be in camera coordinates as colmap outputs. 
+
     return parser.parse_args()
 
 def read_calibration(calib_path):
@@ -144,6 +145,9 @@ def main():
     # Prepare data structures for efficient processing
     image_data = []
     camera_positions = []
+
+
+    
     
     print("Processing camera poses...")
     for img in meta['images']:
@@ -168,6 +172,9 @@ def main():
         # Normalize translation
         t_norm = t - np.array([min_x, min_y, min_z], dtype=np.float64)
         
+        # Extract just the filename from the path
+        img_name = os.path.basename(img["path"])
+        
         # Convert extrinsics to COLMAP convention
         if args.extrinsics_type == 'cam_to_world':
             # t is camera center in world coordinates
@@ -183,15 +190,9 @@ def main():
                 'qw': qw_c, 'qx': qx_c, 'qy': qy_c, 'qz': qz_c,
                 'tx': tx, 'ty': ty, 'tz': tz,
                 'cam_id': cam_id,
-                'name': img["path"]
+                'name': img_name
             })
             
-            # Store for cameraPositions.txt (training format)
-            camera_positions.append(camera_to_training_format(
-                len(camera_positions), qw_c, qx_c, qy_c, qz_c, 
-                tx, ty, tz, cam_params_dict['width'], cam_params_dict['height'],
-                cam_params_dict['fx'], cam_params_dict['fy'], cam_id, img["path"]
-            ))
             
         else:
             # t is world-to-camera translation, need to compute camera center
@@ -206,16 +207,9 @@ def main():
                 'qw': qw, 'qx': qx, 'qy': qy, 'qz': qz,
                 'tx': tx, 'ty': ty, 'tz': tz,
                 'cam_id': cam_id,
-                'name': img["path"]
+                'name': img_name
             })
             
-            # Store for cameraPositions.txt (training format)
-            camera_positions.append(camera_to_training_format(
-                len(camera_positions), qw, qx, qy, qz, 
-                tx, ty, tz, cam_params_dict['width'], cam_params_dict['height'],
-                cam_params_dict['fx'], cam_params_dict['fy'], cam_id, img["path"]
-            ))
-    
     # Write images.txt efficiently
     print("Writing images.txt...")
     with open(os.path.join(args.outdir, 'images.txt'), 'w') as f:
@@ -224,42 +218,28 @@ def main():
         for img_data in image_data:
             f.write(f'{img_data["id"]} {img_data["qw"]} {img_data["qx"]} {img_data["qy"]} {img_data["qz"]} {img_data["tx"]} {img_data["ty"]} {img_data["tz"]} {img_data["cam_id"]} {img_data["name"]}\n\n')
     
-    # Write cameraPositions.txt (training format)
-    print("Writing cameraPositions.txt...")
-    with open(os.path.join(args.outdir, 'cameraPositions.txt'), 'w') as f:
-        f.write('# Camera positions in training format (same as cameras.json)\n')
-        f.write('#   IMAGE_ID, TX, TY, TZ, R11, R12, R13, R21, R22, R23, R31, R32, R33, Camera_ID, Img_NAME\n')
-        for cam in camera_positions:
-            tx, ty, tz = cam['position']
-            rot = cam['rotation']
-            f.write(f"{cam['id']} {tx:.6f} {ty:.6f} {tz:.6f} {rot[0][0]:.6f} {rot[0][1]:.6f} {rot[0][2]:.6f} {rot[1][0]:.6f} {rot[1][1]:.6f} {rot[1][2]:.6f} {rot[2][0]:.6f} {rot[2][1]:.6f} {rot[2][2]:.6f} {cam['cam_id']} {cam['img_name']}\n")
-    
-    # Write cameras.json (exact training format)
-    print("Writing cameras.json...")
-    with open(os.path.join(args.outdir, 'cameras.json'), 'w') as f:
-        json.dump(camera_positions, f, indent=2)
     
     # Create trajectory data for visualization
-    if camera_positions:
-        print("Creating trajectory visualization...")
-        trajectory_data = {
-            "positions": np.array([cam['position'] for cam in camera_positions]),
-            "quaternions": []
-        }
-        
-        # Convert rotation matrices back to quaternions for visualization
-        for cam in camera_positions:
-            rot_matrix = np.array(cam['rotation'])
-            # Convert rotation matrix to quaternion (xyzw format)
-            quat = R.from_matrix(rot_matrix).as_quat()
-            trajectory_data["quaternions"].append(quat)
-        
-        trajectory_data["quaternions"] = np.array(trajectory_data["quaternions"])
-        
-        # Save trajectory visualization as PLY
-        trajectory_ply_path = os.path.join(args.outdir, 'trajectory.ply')
-        save_basis_vectors_ply(trajectory_data, trajectory_ply_path, offset=0.5)
-        print(f"Trajectory visualization saved to: {trajectory_ply_path}")
+    if image_data:
+        print("Creating trajectory visualization (CameraTrajectory.txt)...")
+        sensor_map = {"left": 0, "front": 1, "right": 2, "retro": 3}
+        with open(os.path.join(args.outdir, 'CameraTrajectory.txt'), 'w') as f:
+            f.write('serial x y z qx qy qz qw sensor_id\n')
+            serial = 0
+            for img in meta['images']:
+                if 'pose' not in img or 'translation' not in img['pose'] or 'orientation_xyzw' not in img['pose']:
+                    continue
+                t = np.array(img['pose']['translation'], dtype=np.float64)
+                q = img['pose']['orientation_xyzw']
+                if len(q) != 4:
+                    continue
+                qx, qy, qz, qw = q
+                t_norm = t - np.array([min_x, min_y, min_z], dtype=np.float64)
+                sensor_id = img.get('sensor_id', '')
+                sensor_code = sensor_map.get(sensor_id, -1)
+                f.write(f"{serial} {t_norm[0]:.6f} {t_norm[1]:.6f} {t_norm[2]:.6f} {qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f} {sensor_code}\n")
+                serial += 1
+        print(f"CameraTrajectory.txt written to: {os.path.join(args.outdir, 'CameraTrajectory.txt')}")
     
     # Print summary statistics efficiently
     print("\n=== SUMMARY ===")
