@@ -78,7 +78,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
     ema_graph_maha_for_log = 0.0
-    ema_Lsphericity_for_log = 0.0 # New: EMA for spherical loss
+    ema_Lsphericity_for_log = 0.0 # Sphericity tracking removed
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -137,16 +137,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-        # Spherical regularization loss
-        Lsphericity_pure = 0.0
-        if opt.lambda_sphere_reg > 0:
-            Lsphericity_pure = gaussians.compute_spherical_loss()
-            Lsphericity = opt.lambda_sphere_reg * Lsphericity_pure
-            loss += Lsphericity
-            Lsphericity = Lsphericity.item()
-        else:
-            Lsphericity = 0
-
         # Depth regularization
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
@@ -187,14 +177,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
             ema_graph_maha_for_log = 0.4 * Lgmaha + 0.6 * ema_graph_maha_for_log
-            ema_Lsphericity_for_log = 0.4 * Lsphericity + 0.6 * ema_Lsphericity_for_log # New: EMA for spherical loss
 
             if iteration % 10 == 0:
                 progress_bar.set_postfix({
                     "Loss": f"{ema_loss_for_log:.{7}f}", 
                     "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}", 
                     "Graph Maha": f"{ema_graph_maha_for_log:.{7}f}",
-                    "Sphericity": f"{ema_Lsphericity_for_log:.{7}f}" # New: Add sphericity to progress bar
                 })
                 progress_bar.update(10)
             if iteration == opt.iterations:
@@ -202,7 +190,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             torch.cuda.empty_cache()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, float(Lgmaha_pure) if isinstance(Lgmaha_pure, torch.Tensor) else Lgmaha_pure, float(Lgmaha) if isinstance(Lgmaha, float) else Lgmaha, float(Lsphericity_pure) if isinstance(Lsphericity_pure, torch.Tensor) else Lsphericity_pure, float(Lsphericity) if isinstance(Lsphericity, float) else Lsphericity)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, float(Lgmaha_pure) if isinstance(Lgmaha_pure, torch.Tensor) else Lgmaha_pure, float(Lgmaha) if isinstance(Lgmaha, float) else Lgmaha, 0.0, 0.0)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
