@@ -9,10 +9,10 @@ import sys
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Convert FHF dataset to COLMAP format with normalization (translations and LAS points only).")
-    parser.add_argument('--meta', default='/mnt/data/tijaz/data/section_3useful/metaFiltered.json', help='Path to meta.json')
-    parser.add_argument('--calib', default='/mnt/data/tijaz/data/section_3useful/calibration.csv', help='Path to calibration.csv')
-    parser.add_argument('--las', default='/mnt/data/tijaz/data/section_3useful/points3D_withoutBB.las', help='Path to points3D_withoutBB.las')
-    parser.add_argument('--outdir', default='/mnt/data/tijaz/data/section3ready/sparse/0/', help='Output directory for COLMAP files')
+    parser.add_argument('--meta', default='/mnt/data/tijaz/data/AlignData/LiDAROutput/metaFiltered.json', help='Path to meta.json')
+    parser.add_argument('--calib', default='/mnt/data/tijaz/data/AlignData/LiDAROutput/calibration.csv', help='Path to calibration.csv')
+    parser.add_argument('--las', default='/mnt/data/tijaz/data/AlignData/LiDAROutput/points3D_withoutBB.las', help='Path to points3D_withoutBB.las')
+    parser.add_argument('--outdir', default='/mnt/data/tijaz/data/AlignData/LiDAROutput', help='Output directory for COLMAP files')
     parser.add_argument('--extrinsics-type', choices=['cam_to_world','world_to_cam'], default='cam_to_world', help='Type of extrinsics') # cam to world means camera coordinates, images.txt needs to be in camera coordinates as colmap outputs. 
 
     return parser.parse_args()
@@ -63,45 +63,6 @@ def read_las_laspy(las_path):
     
     return coords, colors, min_x, min_y, min_z
 
-def fov2focal(fov, pixels):
-    """Convert field of view to focal length (same as training system)"""
-    return pixels / (2 * np.tan(fov / 2))
-
-def camera_to_training_format(cam_id, qw, qx, qy, qz, tx, ty, tz, width, height, fx, fy, colmap_cam_id, img_name):
-    """Convert camera data to the same format used in training (cameras.json)"""
-    # Convert quaternion to rotation matrix
-    rot = R.from_quat([qx, qy, qz, qw])
-    R_matrix = rot.as_matrix()
-    
-    # Create world-to-camera transform matrix
-    Rt = np.zeros((4, 4))
-    Rt[:3, :3] = R_matrix.T  # Transpose for world-to-camera
-    Rt[:3, 3] = [tx, ty, tz]
-    Rt[3, 3] = 1.0
-    
-    # Invert to get camera-to-world transform
-    W2C = np.linalg.inv(Rt)
-    pos = W2C[:3, 3]  # Camera position in world coordinates
-    rot_world = W2C[:3, :3]  # Camera rotation in world coordinates
-    
-    # Convert to degrees for FOV calculation
-    fovx = 2 * np.arctan(width / (2 * fx))
-    fovy = 2 * np.arctan(height / (2 * fy))
-    
-    return {
-        'id': cam_id,
-        'position': pos.tolist(),
-        'rotation': rot_world.tolist(),
-        'fx': fx,
-        'fy': fy,
-        'width': width,
-        'height': height,
-        'fovx': fovx,
-        'fovy': fovy,
-        'cam_id': colmap_cam_id,
-        'img_name': img_name
-    }
-
 def main():
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
@@ -144,9 +105,6 @@ def main():
     # Prepare data structures for efficient processing
     image_data = []
     camera_positions = []
-
-
-    
     
     print("Processing camera poses...")
     for img in meta['images']:
@@ -214,6 +172,8 @@ def main():
     with open(os.path.join(args.outdir, 'images.txt'), 'w') as f:
         f.write('# Image list with two lines of data per image:\n')
         f.write('#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n')
+        f.write('#   POINTS2D[] as (X, Y, POINT3D_ID)\n')
+        f.write(f'# Number of images: {len(image_data)}\n')
         for img_data in image_data:
             f.write(f'{img_data["id"]} {img_data["qw"]} {img_data["qx"]} {img_data["qy"]} {img_data["qz"]} {img_data["tx"]} {img_data["ty"]} {img_data["tz"]} {img_data["cam_id"]} {img_data["name"]}\n\n')
     
@@ -238,6 +198,12 @@ def main():
         print(f"TX range: {tx_coords.min():.6f} to {tx_coords.max():.6f}")
         print(f"TY range: {ty_coords.min():.6f} to {ty_coords.max():.6f}")
         print(f"TZ range: {tz_coords.min():.6f} to {tz_coords.max():.6f}")
+    
+    # Save normalization transformation matrix
+    norm_transform = np.eye(4)
+    norm_transform[:3, 3] = [min_x, min_y, min_z]
+    np.savetxt(os.path.join(args.outdir, 'normalization_transform.txt'), norm_transform, fmt='%.8f')
+    print(f"Normalization transform saved to {os.path.join(args.outdir, 'normalization_transform.txt')}")
 
 if __name__ == '__main__':
     main()

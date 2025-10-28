@@ -1,23 +1,22 @@
 import argparse
-import numpy as np
 
-def read_points3d(path):
+def read_images_txt(path):
     points = []
-    colors = []
+    meta = []
     with open(path, 'r') as f:
         for line in f:
-            if line.startswith('#'):
+            if line.startswith('#') or not line.strip():
                 continue
             parts = line.strip().split()
-            if len(parts) < 7:
+            if len(parts) < 10:
                 continue
-            x, y, z = map(float, parts[1:4])
-            r, g, b = map(int, parts[4:7])
+            # IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME
+            x, y, z = map(float, parts[5:8])
             points.append([x, y, z])
-            colors.append([r, g, b])
-    return np.array(points), np.array(colors)
+            meta.append(parts[:10])
+    return points, meta
 
-def write_ply(path, points, colors):
+def write_ply(path, points):
     n = len(points)
     with open(path, 'w') as f:
         f.write('ply\n')
@@ -30,18 +29,18 @@ def write_ply(path, points, colors):
         f.write('property uchar green\n')
         f.write('property uchar blue\n')
         f.write('end_header\n')
-        for pt, col in zip(points, colors):
-            f.write(f'{pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f} {col[0]} {col[1]} {col[2]}\n')
+        for pt in points:
+            f.write(f'{pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f} 255 255 255\n')
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert COLMAP points3D.txt to PLY format")
-    parser.add_argument('--input', required=True, help='Input points3D.txt file')
+    parser = argparse.ArgumentParser(description="Convert images.txt camera centers to PLY (white color)")
+    parser.add_argument('--input', required=True, help='Input images.txt file')
     parser.add_argument('--output', required=True, help='Output PLY file')
     args = parser.parse_args()
 
-    points, colors = read_points3d(args.input)
-    write_ply(args.output, points, colors)
-    print(f"Wrote {len(points)} points to {args.output}")
+    points, meta = read_images_txt(args.input)
+    write_ply(args.output, points)
+    print(f"Wrote {len(points)} camera centers to {args.output} (white color)")
 
 if __name__ == "__main__":
     main()

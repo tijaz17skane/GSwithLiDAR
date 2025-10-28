@@ -18,6 +18,9 @@ args = parser.parse_args()
 with open(args.txt_path, "r") as f:
     lines = f.readlines()
 
+# Keep rows 1-4 (lines[0:4]), then skip every other line starting from the 5th row (lines[4], lines[6], lines[8], ...)
+lines = lines[:4] + [line for idx, line in enumerate(lines[4:], start=4) if (idx - 4) % 2 == 0]
+
 header_line = None
 for i, line in enumerate(lines):
     if line.strip().startswith("#") and "IMAGE_ID" in line:
