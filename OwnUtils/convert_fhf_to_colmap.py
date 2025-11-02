@@ -6,16 +6,37 @@ import laspy
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import sys
+from createEmptyDatabase import create_empty_database
+import sqlite3
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Convert FHF dataset to COLMAP format with normalization (translations and LAS points only).")
-    parser.add_argument('--meta', default='/mnt/data/tijaz/data/AlignData/LiDAROutput/metaFiltered.json', help='Path to meta.json')
-    parser.add_argument('--calib', default='/mnt/data/tijaz/data/AlignData/LiDAROutput/calibration.csv', help='Path to calibration.csv')
-    parser.add_argument('--las', default='/mnt/data/tijaz/data/AlignData/LiDAROutput/points3D_withoutBB.las', help='Path to points3D_withoutBB.las')
-    parser.add_argument('--outdir', default='/mnt/data/tijaz/data/AlignData/LiDAROutput', help='Output directory for COLMAP files')
+    parser.add_argument('--meta', default='/mnt/data/tijaz/data/section_3/meta.json', help='Path to meta.json')
+    parser.add_argument('--calib', default='/mnt/data/tijaz/data/section_3/tabular/calibration.csv', help='Path to calibration.csv')
+    parser.add_argument('--las', default='/mnt/data/tijaz/data/section_3/annotated_ftth.las', help='Path to 3D point cloud LAS file')
+    parser.add_argument('--outdir', default='/mnt/data/tijaz/data/AlignData/manualModel/inputRawData', help='Output directory for COLMAP files')
     parser.add_argument('--extrinsics-type', choices=['cam_to_world','world_to_cam'], default='cam_to_world', help='Type of extrinsics') # cam to world means camera coordinates, images.txt needs to be in camera coordinates as colmap outputs. 
+    parser.add_argument('--normalize', action='store_true', help='Apply normalization to translation and LAS points')
+    parser.add_argument('--images_folder', type=str, default=None, help='Path to folder containing images to filter output')
 
     return parser.parse_args()
+
+
+MODEL_NAME_TO_ID = {
+    'SIMPLE_PINHOLE': 0,
+    'PINHOLE': 1,
+    'SIMPLE_RADIAL': 2,
+    'RADIAL': 3,
+    'OPENCV': 4,
+    'FULL_OPENCV': 5,
+    'FOV': 6,
+    'THIN_PRISM_FISHEYE': 7,
+    'SIMPLE_RADIAL_FISHEYE': 8,
+    'RADIAL_FISHEYE': 9,
+    'OPENCV_FISHEYE': 10,
+}
+
+
 
 def read_calibration(calib_path):
     sensor_to_camid = {}
@@ -63,6 +84,66 @@ def read_las_laspy(las_path):
     
     return coords, colors, min_x, min_y, min_z
 
+def write_colmap_database(images_txt_path, cameras_txt_path, db_path):
+    # Create empty COLMAP-style database
+    create_empty_database(db_path)
+
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+
+    # Insert cameras
+    with open(cameras_txt_path, 'r') as f:
+        for line in f:
+            if line.startswith('#') or not line.strip():
+                continue
+            parts = line.strip().split()
+            if len(parts) < 5:  # CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS...
+                continue
+
+            camera_id = int(parts[0])
+            model_str = parts[1]
+            model_id = MODEL_NAME_TO_ID.get(model_str)
+            if model_id is None:
+                raise ValueError(f"Unknown camera model: {model_str}")
+
+            width = int(parts[2])
+            height = int(parts[3])
+            # Remaining are params; convert to float64 and store as BLOB
+            param_vals = list(map(float, parts[4:]))
+            params_blob = np.array(param_vals, dtype=np.float64).tobytes()
+
+            prior_focal_length = 1
+            c.execute(
+                "INSERT OR REPLACE INTO cameras (camera_id, model, width, height, params, prior_focal_length) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (camera_id, model_id, width, height, sqlite3.Binary(params_blob), prior_focal_length),
+            )
+
+    # Insert images
+    with open(images_txt_path, 'r') as f:
+        for line in f:
+            if line.startswith('#') or not line.strip():
+                continue
+            parts = line.strip().split()
+            if len(parts) < 10:
+                continue
+
+            image_id = int(parts[0])
+            qw, qx, qy, qz = map(float, parts[1:5])
+            tx, ty, tz = map(float, parts[5:8])
+            camera_id = int(parts[8])
+            name = parts[9]
+
+            c.execute(
+                "INSERT OR REPLACE INTO images "
+                "(image_id, name, camera_id, prior_qw, prior_qx, prior_qy, prior_qz, prior_tx, prior_ty, prior_tz) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (image_id, name, camera_id, qw, qx, qy, qz, tx, ty, tz),
+            )
+
+    conn.commit()
+    conn.close()
+
 def main():
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
@@ -72,24 +153,24 @@ def main():
     
     # LAS (use laspy for binary LAS) - vectorized
     coords, colors, min_x, min_y, min_z = read_las_laspy(args.las)
-    
-    # Normalize LAS points efficiently
-    norm_coords = coords - np.array([min_x, min_y, min_z])
-    
+
+    # Normalize LAS points efficiently if requested
+    if args.normalize:
+        norm_coords = coords - np.array([min_x, min_y, min_z])
+    else:
+        norm_coords = coords.copy()
+
     # Write points3D.txt efficiently
     print("Writing points3D.txt...")
     with open(os.path.join(args.outdir, 'points3D.txt'), 'w') as f:
         f.write('# 3D point list with one line of data per point:\n')
         f.write('#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n')
-        
-        # Process colors efficiently
         colors_normalized = np.clip(colors // 256, 0, 255)
-        
         for i, (coord, color) in enumerate(zip(norm_coords, colors_normalized)):
             x, y, z = coord
             r, g, b = color
             f.write(f'{i+1} {x:.6f} {y:.6f} {z:.6f} {r} {g} {b} 1.0\n')
-    
+
     # Write cameras.txt (intrinsics and resolution are NOT normalized)
     print("Writing cameras.txt...")
     with open(os.path.join(args.outdir, 'cameras.txt'), 'w') as f:
@@ -105,7 +186,12 @@ def main():
     # Prepare data structures for efficient processing
     image_data = []
     camera_positions = []
-    
+
+    # If images_folder is provided, get set of image names
+    images_set = None
+    if args.images_folder:
+        images_set = set(os.listdir(args.images_folder))
+
     print("Processing camera poses...")
     for img in meta['images']:
         if 'pose' not in img or 'translation' not in img['pose'] or 'orientation_xyzw' not in img['pose']:
@@ -120,18 +206,21 @@ def main():
         
         t = np.array(img['pose']['translation'], dtype=np.float64)
         q = img['pose']['orientation_xyzw']
-        
         if len(q) != 4:
             continue
-            
         qx, qy, qz, qw = q
-        
-        # Normalize translation
-        t_norm = t - np.array([min_x, min_y, min_z], dtype=np.float64)
+        # Normalize translation if requested
+        if args.normalize:
+            t_norm = t - np.array([min_x, min_y, min_z], dtype=np.float64)
+        else:
+            t_norm = t.copy()
         
         # Extract just the filename from the path
         img_name = os.path.basename(img["path"])
-        
+        # Filter by images_folder if provided
+        if images_set is not None and img_name not in images_set:
+            continue
+
         # Convert extrinsics to COLMAP convention
         if args.extrinsics_type == 'cam_to_world':
             # t is camera center in world coordinates
@@ -167,16 +256,21 @@ def main():
                 'name': img_name
             })
             
-    # Write images.txt efficiently
+    # Write images.txt and cameras.txt efficiently
     print("Writing images.txt...")
-    with open(os.path.join(args.outdir, 'images.txt'), 'w') as f:
+    images_txt_path = os.path.join(args.outdir, 'images.txt')
+    with open(images_txt_path, 'w') as f:
         f.write('# Image list with two lines of data per image:\n')
         f.write('#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n')
         f.write('#   POINTS2D[] as (X, Y, POINT3D_ID)\n')
         f.write(f'# Number of images: {len(image_data)}\n')
         for img_data in image_data:
             f.write(f'{img_data["id"]} {img_data["qw"]} {img_data["qx"]} {img_data["qy"]} {img_data["qz"]} {img_data["tx"]} {img_data["ty"]} {img_data["tz"]} {img_data["cam_id"]} {img_data["name"]}\n\n')
-    
+    cameras_txt_path = os.path.join(args.outdir, 'cameras.txt')
+    # Write to database.db after writing txt files
+    db_path = os.path.join(args.outdir, 'database.db')
+    write_colmap_database(images_txt_path, cameras_txt_path, db_path)
+    print(f"database.db written to {db_path}")
     
     # Print summary statistics efficiently
     print("\n=== SUMMARY ===")
@@ -199,11 +293,12 @@ def main():
         print(f"TY range: {ty_coords.min():.6f} to {ty_coords.max():.6f}")
         print(f"TZ range: {tz_coords.min():.6f} to {tz_coords.max():.6f}")
     
-    # Save normalization transformation matrix
-    norm_transform = np.eye(4)
-    norm_transform[:3, 3] = [min_x, min_y, min_z]
-    np.savetxt(os.path.join(args.outdir, 'normalization_transform.txt'), norm_transform, fmt='%.8f')
-    print(f"Normalization transform saved to {os.path.join(args.outdir, 'normalization_transform.txt')}")
+    # Save normalization transformation matrix if requested
+    if args.normalize:
+        norm_transform = np.eye(4)
+        norm_transform[:3, 3] = [min_x, min_y, min_z]
+        np.savetxt(os.path.join(args.outdir, 'normalization_transform.txt'), norm_transform, fmt='%.8f')
+        print(f"Normalization transform saved to {os.path.join(args.outdir, 'normalization_transform.txt')}")
 
 if __name__ == '__main__':
     main()

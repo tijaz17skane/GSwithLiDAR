@@ -12,6 +12,7 @@ parser.add_argument("--out_gpkg", type=str, help="Output GPKG file path")
 parser.add_argument("--out_ply", type=str, help="Output PLY file path")
 parser.add_argument("--out_txt", type=str, help="Output TXT file path")
 parser.add_argument("--normalization_transform", type=str, help="Path to normalization_transform.txt (optional)")
+parser.add_argument("--normalize", action="store_true", help="Apply normalization transform if provided")
 args = parser.parse_args()
 
 # Find header and read data
@@ -50,9 +51,11 @@ for col in ["TX", "TY", "TZ"]:
 
 # Read normalization transform if provided
 norm_offset = None
-if args.normalization_transform:
+if args.normalization_transform and args.normalize:
     norm_matrix = np.loadtxt(args.normalization_transform)
     norm_offset = norm_matrix[:3, 3]
+else:
+    norm_offset = None
 
 # Camera-to-world conversion: get camera position in world coordinates
 if all(col in df.columns for col in ["QW", "QX", "QY", "QZ", "TX", "TY", "TZ"]):
@@ -102,10 +105,11 @@ if args.out_ply:
     print(f"PLY written to {args.out_ply}")
 
 if args.out_txt:
-    def write_txt(positions, txt_path):
+    def write_txt(df, txt_path):
+        columns_to_write = ["IMAGE_ID", "QW", "QX", "QY", "QZ", "TX", "TY", "TZ", "CAMERA_ID", "NAME"]
         with open(txt_path, "w") as f:
-            f.write("x y z\n")
-            for p in positions:
-                f.write("{:.6f} {:.6f} {:.6f}\n".format(p[0], p[1], p[2]))
-    write_txt(positions, args.out_txt)
+            f.write("# " + " ".join(columns_to_write) + "\n")
+            for _, row in df.iterrows():
+                f.write(" ".join([str(row[col]) for col in columns_to_write]) + "\n")
+    write_txt(df, args.out_txt)
     print(f"TXT written to {args.out_txt}")
