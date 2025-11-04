@@ -8,18 +8,29 @@ from scipy.spatial.transform import Rotation as R
 import sys
 from createEmptyDatabase import create_empty_database
 import sqlite3
+from cam_world_conversions import world2cam
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Convert FHF dataset to COLMAP format with normalization (translations and LAS points only).")
-    parser.add_argument('--meta', default='/mnt/data/tijaz/data/section_3/meta.json', help='Path to meta.json')
-    parser.add_argument('--calib', default='/mnt/data/tijaz/data/section_3/tabular/calibration.csv', help='Path to calibration.csv')
-    parser.add_argument('--las', default='/mnt/data/tijaz/data/section_3/annotated_ftth.las', help='Path to 3D point cloud LAS file')
-    parser.add_argument('--outdir', default='/mnt/data/tijaz/data/AlignData/manualModel/inputRawData', help='Output directory for COLMAP files')
-    parser.add_argument('--extrinsics-type', choices=['cam_to_world','world_to_cam'], default='cam_to_world', help='Type of extrinsics') # cam to world means camera coordinates, images.txt needs to be in camera coordinates as colmap outputs. 
+    parser.add_argument('--meta', default='/mnt/data/tijaz/data/betterConverters/section_3/meta.json', help='Path to meta.json')
+    parser.add_argument('--calib', default='/mnt/data/tijaz/data/betterConverters/section_3/tabular/calibration.csv', help='Path to calibration.csv')
+    parser.add_argument('--las', default='/mnt/data/tijaz/data/betterConverters/section_3/annotated_ftth.las', help='Path to 3D point cloud LAS file')
+    parser.add_argument('--outdir', default='/mnt/data/tijaz/data/betterConverters/section_3/converted2Colmap', help='Output directory for COLMAP files')
     parser.add_argument('--normalize', action='store_true', help='Apply normalization to translation and LAS points')
-    parser.add_argument('--images_folder', type=str, default=None, help='Path to folder containing images to filter output')
+    parser.add_argument('--images_folder', type=str, default='/mnt/data/tijaz/data/betterConverters/section_3/images', help='Path to folder containing images to filter output')
 
     return parser.parse_args()
+
+'''
+    --meta is the meta.json file from fhf dataset
+    --calib is the calibration.csv file from fhf dataset inside the tabular folder
+    --las is the annotated_ftth.las file from fhf dataset
+    --outdir is the output directory to save colmap files
+    --normalize applies normalization to translation and LAS points. Without translation the gradients explode, but with this normalization it doesn't work well.
+    rather transform it to colmap and it should work better on that scale.
+    --images_folder is the path to the folder containing images to filter output. So that we only get poses for the images that are present in the folder. 
+'''
+
 
 
 MODEL_NAME_TO_ID = {
@@ -35,8 +46,6 @@ MODEL_NAME_TO_ID = {
     'RADIAL_FISHEYE': 9,
     'OPENCV_FISHEYE': 10,
 }
-
-
 
 def read_calibration(calib_path):
     sensor_to_camid = {}
@@ -221,40 +230,21 @@ def main():
         if images_set is not None and img_name not in images_set:
             continue
 
-        # Convert extrinsics to COLMAP convention
-        if args.extrinsics_type == 'cam_to_world':
-            # t is camera center in world coordinates
-            rot = R.from_quat([qx, qy, qz, qw])
-            rot_inv = rot.inv()
-            t_colmap = -rot_inv.apply(t_norm)
-            tx, ty, tz = t_colmap.tolist()
-            qx_c, qy_c, qz_c, qw_c = rot_inv.as_quat()
-            
-            # Store for images.txt
-            image_data.append({
-                'id': len(image_data) + 1,
-                'qw': qw_c, 'qx': qx_c, 'qy': qy_c, 'qz': qz_c,
-                'tx': tx, 'ty': ty, 'tz': tz,
-                'cam_id': cam_id,
-                'name': img_name
-            })
-            
-            
-        else:
-            # t is world-to-camera translation, need to compute camera center
-            rot = R.from_quat([qx, qy, qz, qw])
-            Rmat = rot.as_matrix()
-            C = -Rmat.T @ t_norm
-            tx, ty, tz = C.tolist()
-            
-            # Store for images.txt
-            image_data.append({
-                'id': len(image_data) + 1,
-                'qw': qw, 'qx': qx, 'qy': qy, 'qz': qz,
-                'tx': tx, 'ty': ty, 'tz': tz,
-                'cam_id': cam_id,
-                'name': img_name
-            })
+        # Convert extrinsics to COLMAP convention using world2cam function
+        # t_norm is camera center in world coordinates
+        norm_offset = np.array([min_x, min_y, min_z]) if args.normalize else None
+        t_cam, R_w2c = world2cam(qw, qx, qy, qz, t_norm[0], t_norm[1], t_norm[2], norm_offset)
+        tx, ty, tz = t_cam.tolist()
+        qx_c, qy_c, qz_c, qw_c = R.from_matrix(R_w2c).as_quat()
+        
+        # Store for images.txt
+        image_data.append({
+            'id': len(image_data) + 1,
+            'qw': qw_c, 'qx': qx_c, 'qy': qy_c, 'qz': qz_c,
+            'tx': tx, 'ty': ty, 'tz': tz,
+            'cam_id': cam_id,
+            'name': img_name
+        })
             
     # Write images.txt and cameras.txt efficiently
     print("Writing images.txt...")
