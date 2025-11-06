@@ -12,12 +12,12 @@ from cam_world_conversions import world2cam
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Convert FHF dataset to COLMAP format with normalization (translations and LAS points only).")
-    parser.add_argument('--meta', default='/mnt/data/tijaz/data/betterConverters/section_3/meta.json', help='Path to meta.json')
-    parser.add_argument('--calib', default='/mnt/data/tijaz/data/betterConverters/section_3/tabular/calibration.csv', help='Path to calibration.csv')
-    parser.add_argument('--las', default='/mnt/data/tijaz/data/betterConverters/section_3/annotated_ftth.las', help='Path to 3D point cloud LAS file')
-    parser.add_argument('--outdir', default='/mnt/data/tijaz/data/betterConverters/section_3/converted2Colmap', help='Output directory for COLMAP files')
+    parser.add_argument('--meta', default='/mnt/data/tijaz/data/section_3mappedOnColmap/metaFiltered.json', help='Path to meta.json')
+    parser.add_argument('--calib', default='/mnt/data/tijaz/data/section_3mappedOnColmap/calibration.csv', help='Path to calibration.csv')
+    parser.add_argument('--las', default='/mnt/data/tijaz/data/section_3mappedOnColmap/annotated_ftth_downsampled.las', help='Path to 3D point cloud LAS file')
+    parser.add_argument('--outdir', default='/mnt/data/tijaz/data/section_3mappedOnColmap/converted2Colmap', help='Output directory for COLMAP files')
     parser.add_argument('--normalize', action='store_true', help='Apply normalization to translation and LAS points')
-    parser.add_argument('--images_folder', type=str, default='/mnt/data/tijaz/data/betterConverters/section_3/images', help='Path to folder containing images to filter output')
+    parser.add_argument('--images_folder', type=str, default='/mnt/data/tijaz/data/section_3mappedOnColmap/images', help='Path to folder containing images to filter output')
 
     return parser.parse_args()
 
