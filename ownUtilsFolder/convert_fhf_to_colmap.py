@@ -383,10 +383,10 @@ def main():
         # Convert extrinsics to COLMAP convention using world2cam function
         # t_norm is camera center in world coordinates
         norm_offset = np.array([min_x, min_y, min_z]) if args.normalize else None
-        t_cam, R_w2c = world2cam(qw, qx, qy, qz, t_norm[0], t_norm[1], t_norm[2], norm_offset)
+        t_cam, R_cam , q_cam = world2cam(qw, qx, qy, qz, t_norm[0], t_norm[1], t_norm[2], norm_offset)
         tx, ty, tz = t_cam.tolist()
-        qx_c, qy_c, qz_c, qw_c = R.from_matrix(R_w2c).as_quat()
-        
+        qw_c, qx_c, qy_c, qz_c = q_cam.tolist()
+
         # Store for images.txt
         image_data.append({
             'id': len(image_data) + 1,
