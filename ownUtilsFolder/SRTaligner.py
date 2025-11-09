@@ -36,14 +36,6 @@ def rotation_matrix_to_quaternion(R_mat, order='wxyz'):
 
     return q
 
-
-def quat_wxyz_to_matrix(q_wxyz: np.ndarray) -> np.ndarray:
-    """Convert quaternion in wxyz order to 3x3 rotation matrix."""
-    q = np.asarray(q_wxyz, dtype=np.float64)
-    r = R.from_quat([q[1], q[2], q[3], q[0]])  # xyzw
-    return r.as_matrix()
-
-
 def multiply_quaternions_wxyz(q1, q2):
     """Hamilton product q = q1 * q2 for quaternions in wxyz order.
     Rotation applied: first q2 then q1 (since R(q1*q2)=R(q1)@R(q2)).
@@ -422,6 +414,67 @@ def umeyama_alignment(A, B):
     return R, t, s
 
 
+def quaternion_wxyz_to_matrix(q):
+    """Convert wxyz quaternion to 3x3 rotation matrix."""
+    q = np.asarray(q, dtype=np.float64)
+    return R.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+
+
+def umeyama_alignment_with_orientation(A_pos, B_pos, RwA_list, RwB_list, orient_weight=0.0):
+    """Similarity transform estimation with optional orientation weighting.
+    Minimizes: sum_i || s R C_a_i + t - C_b_i ||^2 + orient_weight * sum_i,j || R * axis_a_ij - axis_b_ij ||^2
+    Orientation influences only rotation (not scale). Scale computed from positions only.
+    Args:
+        A_pos, B_pos: (N,3) matched world camera centers from source and target.
+        RwA_list, RwB_list: list of 3x3 world rotation matrices for matched cameras.
+        orient_weight: lambda >=0. 0 -> standard Umeyama on positions only.
+    Returns:
+        R (3x3), t (3,), s (scalar)
+    """
+    assert A_pos.shape == B_pos.shape
+    N = A_pos.shape[0]
+    mu_A = A_pos.mean(axis=0)
+    mu_B = B_pos.mean(axis=0)
+    X_pos = A_pos - mu_A
+    Y_pos = B_pos - mu_B
+    # Position cross-covariance
+    Sigma_pos = (Y_pos.T @ X_pos) / N
+    # Basic positional SVD for scale later
+    Upos, Dpos, Vtpos = np.linalg.svd(Sigma_pos)
+    # Reflection correction for position-only rotation (for scale computation trace consistency)
+    if np.linalg.det(Upos @ Vtpos) < 0:
+        Upos[:, -1] *= -1
+    R_pos_only = Upos @ Vtpos
+    var_A_pos = np.sum(np.linalg.norm(X_pos, axis=1)**2) / N
+    s = (1 / var_A_pos) * np.sum(Dpos)  # scale from positions only
+    # If no orientation weighting requested, fallback
+    if orient_weight <= 0.0:
+        R_final = R_pos_only
+    else:
+        # Build axis correspondences
+        axesA = []
+        axesB = []
+        for Ra, Rb in zip(RwA_list, RwB_list):
+            axesA.append(Ra[:, 0]); axesA.append(Ra[:, 1]); axesA.append(Ra[:, 2])
+            axesB.append(Rb[:, 0]); axesB.append(Rb[:, 1]); axesB.append(Rb[:, 2])
+        axesA = np.vstack(axesA)
+        axesB = np.vstack(axesB)
+        # Center axes (optional, keeps consistency)
+        axesA_c = axesA - axesA.mean(axis=0)
+        axesB_c = axesB - axesB.mean(axis=0)
+        # Axis cross-covariance
+        Sigma_axes = (axesB_c.T @ axesA_c) / axesA_c.shape[0]
+        # Weighted combined covariance (positions + orientation)
+        Sigma_combined = (Sigma_pos + orient_weight * Sigma_axes) / (1.0 + orient_weight)
+        U, D, Vt = np.linalg.svd(Sigma_combined)
+        if np.linalg.det(U @ Vt) < 0:
+            U[:, -1] *= -1
+        R_final = U @ Vt
+    # Translation with final rotation
+    t = mu_B - s * (R_final @ mu_A)
+    return R_final, t, s
+
+
 def transform_points(points, R, t, s):
     """Apply similarity transformation: output = s * R * points + t"""
     return s * (points @ R.T) + t
@@ -797,6 +850,10 @@ INPUT FORMAT:
         """
     )
     
+# =======================================================================
+# ======= Argument Parsing =======
+# =======================================================================
+
     parser.add_argument('--inputA', type=str, required=True,
                        help='Source camera poses file (COLMAP images.txt format or simple TXT)')
     parser.add_argument('--inputB', type=str, required=True,
@@ -807,6 +864,8 @@ INPUT FORMAT:
                        help='Save detailed transformation parameters and statistics to file')
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='Print detailed statistics about the alignment process')
+    parser.add_argument('--orient_weight', type=float, default=0.0,
+                       help='Orientation weight λ (0=positions only). Higher values force rotation to also align camera axes derived from quaternions.')
     
     args = parser.parse_args()
     
@@ -817,7 +876,11 @@ INPUT FORMAT:
     print("Outputs: aligned_in_cam.txt, aligned_in_world.ply, and SRT transformation matrices")
     print("="*70 + "\n")
     
-    # Load camera pose files
+
+# =======================================================================
+# ======= Load Images =======
+# =======================================================================
+
     print(f"Loading source camera poses from: {args.inputA}")
     points_A_world, quats_A, names_A, original_lines_A = load_point_cloud(args.inputA)
     print(f"  → Loaded {len(points_A_world)} cameras (converted from camera to world coordinates)")
@@ -847,6 +910,12 @@ INPUT FORMAT:
         print("  Check that image filenames match between the two files.")
         sys.exit(1)
     
+
+# =======================================================================
+# ======= Compute SRT =======
+# =======================================================================
+
+
     # Compute initial alignment error
     print("\n" + "-"*70)
     print("COMPUTING INITIAL ALIGNMENT ERROR")
@@ -860,62 +929,25 @@ INPUT FORMAT:
     print("\n" + "-"*70)
     print("COMPUTING SIMILARITY TRANSFORMATION (Source A → Target B)")
     print("-"*70)
-    R, t, s = umeyama_alignment(A_matched, B_matched)
+    R, t, s = umeyama_alignment(A_matched, B_matched) if args.orient_weight <= 0.0 else \
+        umeyama_alignment_with_orientation(A_matched, B_matched,
+                                           [quaternion_wxyz_to_matrix(quats_A[names_A.index(n)]) for n in matched_names],
+                                           [quaternion_wxyz_to_matrix(quats_B[names_B.index(n)]) for n in matched_names],
+                                           orient_weight=args.orient_weight)
     
     print(f"\nScale factor (s): {s:.8f}")
     print(f"\nRotation matrix (R):")
     print(R)
+    if args.orient_weight > 0.0:
+        print(f"Orientation weight λ: {args.orient_weight:.3f} (rotation influenced by camera axes)")
     print(f"\nTranslation vector (t):")
     print(f"  [{t[0]:12.8f}, {t[1]:12.8f}, {t[2]:12.8f}]")
-
-    # Optional: orientation-aware global 180° axis correction.
-    # Try C in {I, Rx(π), Ry(π), Rz(π)} and pick the one minimizing mean angular error between
-    # matched world rotations.
-    dict_A_names = {n: i for i, n in enumerate(names_A)}
-    dict_B_names = {n: i for i, n in enumerate(names_B)}
-    qA_matched = np.array([quats_A[dict_A_names[n]] for n in matched_names])
-    qB_matched = np.array([quats_B[dict_B_names[n]] for n in matched_names])
-
-    def mean_angular_error_for_correction(C: np.ndarray) -> float:
-        angles = []
-        for qa, qb in zip(qA_matched, qB_matched):
-            Rw_a = quat_wxyz_to_matrix(qa)
-            Rw_b = quat_wxyz_to_matrix(qb)
-            R_est = C @ R @ Rw_a  # predicted world rotation after alignment
-            R_res = Rw_b @ R_est.T
-            # Clamp trace to valid range
-            trace = np.clip((np.trace(R_res) - 1) / 2.0, -1.0, 1.0)
-            angle = np.degrees(np.arccos(trace)) * 2.0  # convert from half-angle relation? Use robust method below
-            # Prefer robust angle from Rotation
-            try:
-                angle = R.from_matrix(R_res).magnitude() * 180.0 / np.pi
-            except Exception:
-                pass
-            angles.append(angle)
-        return float(np.mean(angles)) if angles else 180.0
-
-    I = np.eye(3)
-    Rx = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float64)
-    Ry = np.array([[-1, 0, 0], [0, 1, 0], [0, 0, -1]], dtype=np.float64)
-    Rz = np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]], dtype=np.float64)
-    candidates = [("I", I), ("Rx180", Rx), ("Ry180", Ry), ("Rz180", Rz)]
-
-    best_name, best_C, best_err = None, None, 1e9
-    for name_c, C in candidates:
-        err = mean_angular_error_for_correction(C)
-        if err < best_err:
-            best_name, best_C, best_err = name_c, C, err
-
-    if best_name is not None and best_name != "I":
-        print(f"\nApplying orientation correction: {best_name} (mean angular error ~ {best_err:.3f}°)")
-        R = best_C @ R
-        # Recompute translation with updated rotation to preserve centroid alignment
-        mu_A = np.mean(A_matched, axis=0)
-        mu_B = np.mean(B_matched, axis=0)
-        t = mu_B - s * (R @ mu_A)
-    else:
-        print(f"\nOrientation correction not needed (best mean angular error ~ {best_err:.3f}°)")
     
+# =======================================================================
+# ======= Apply SRT on Source =======
+# =======================================================================
+
+
     # Apply transformation to ALL cameras from source A
     print("\n" + "-"*70)
     print("APPLYING TRANSFORMATION TO ALL SOURCE CAMERAS")
@@ -923,7 +955,8 @@ INPUT FORMAT:
     C_all_world = transform_points(points_A_world, R, t, s)
     print(f"✓ Transformed all {len(points_A_world)} camera positions from source A")
 
-    # Transform quaternions with updated R (after any orientation correction)
+    
+    # Transform quaternions
     quats_A_transformed = np.array([transform_quaternion(q, R) for q in quats_A])
     print(f"✓ Transformed all {len(quats_A)} camera orientations from source A")
     
@@ -953,6 +986,11 @@ INPUT FORMAT:
     
     # Always save SRT matrices
     save_srt_matrices(args.output_dir, R, t, s)
+
+
+# =======================================================================
+# ===== output to txt for processing and to ply for visualization =======
+# =======================================================================
     
     # Always save aligned_in_world.ply for 3D visualization
     aligned_ply_path = os.path.join(args.output_dir, 'aligned_in_world.ply')

@@ -208,6 +208,8 @@ OUTPUTS:
   points3Dcombined.ply - All points from both inputs (PLY format)
   points3DcombinedCropped.txt - All LiDAR points + COLMAP points within LiDAR bounding box (COLMAP format)
   points3DcombinedCropped.ply - All LiDAR points + COLMAP points within LiDAR bounding box (PLY format)
+  points3DColmapBounded.txt - Only COLMAP points within LiDAR bbox (with --output_bounded_colmap flag)
+  points3DColmapBounded.ply - Only COLMAP points within LiDAR bbox (with --output_bounded_colmap flag)
         """
     )
     
@@ -220,6 +222,10 @@ OUTPUTS:
     parser.add_argument('--output_dir', type=str,
                        default='/mnt/data/tijaz/data/Attempt3/colmapCompleteOutput',
                        help='Output directory for merged point clouds')
+    parser.add_argument('--output_bounded_colmap', action='store_true',
+                       help='Also output COLMAP points bounded by LiDAR bbox (no LiDAR points)')
+    parser.add_argument('--bbox_margin', type=float, default=0.0,
+                       help='Margin to expand (+) or shrink (-) the LiDAR bounding box (in meters). Default: 0.0')
     
     args = parser.parse_args()
     
@@ -250,6 +256,14 @@ OUTPUTS:
     # Compute LiDAR bounding box
     print("\nComputing LiDAR bounding box...")
     min_bound, max_bound = compute_bounding_box(points_lidar)
+    
+    # Apply margin to bounding box
+    if args.bbox_margin != 0.0:
+        print(f"  Applying bounding box margin: {args.bbox_margin:+.4f} meters")
+        min_bound = min_bound - args.bbox_margin
+        max_bound = max_bound + args.bbox_margin
+        print(f"  (Positive margin expands bbox, negative margin shrinks it)")
+    
     print(f"  Min bounds: [{min_bound[0]:.4f}, {min_bound[1]:.4f}, {min_bound[2]:.4f}]")
     print(f"  Max bounds: [{max_bound[0]:.4f}, {max_bound[1]:.4f}, {max_bound[2]:.4f}]")
     bbox_size = max_bound - min_bound
@@ -317,6 +331,24 @@ OUTPUTS:
     write_ply(output_cropped_ply, cropped_points, cropped_colors)
     print(f"  ✓ Saved PLY with {len(cropped_points)} points")
     
+    # Output 3: Bounded COLMAP only (if requested)
+    if args.output_bounded_colmap:
+        print("\n" + "-"*70)
+        print("OUTPUT 3: Bounded COLMAP only (COLMAP points within LiDAR bbox, no LiDAR)")
+        print("-"*70)
+        
+        output_bounded = os.path.join(args.output_dir, 'points3DColmapBounded.txt')
+        print(f"Writing bounded COLMAP point cloud to: {output_bounded}")
+        write_colmap_points3D(output_bounded, points_colmap_filtered, colors_colmap_filtered,
+                              errors_colmap_filtered, ids_colmap_filtered, tracks_colmap_filtered, header_colmap)
+        print(f"  ✓ Saved {len(points_colmap_filtered)} COLMAP points within LiDAR bbox")
+        
+        # Also save as PLY
+        output_bounded_ply = os.path.join(args.output_dir, 'points3DColmapBounded.ply')
+        print(f"Writing bounded COLMAP point cloud (PLY) to: {output_bounded_ply}")
+        write_ply(output_bounded_ply, points_colmap_filtered, colors_colmap_filtered)
+        print(f"  ✓ Saved PLY with {len(points_colmap_filtered)} points")
+    
     print("\n" + "="*70)
     print("✓ POINT CLOUD MERGING COMPLETED SUCCESSFULLY!")
     print("="*70)
@@ -325,6 +357,9 @@ OUTPUTS:
     print(f"  - points3Dcombined.ply ({len(combined_points)} points)")
     print(f"  - points3DcombinedCropped.txt ({len(cropped_points)} points)")
     print(f"  - points3DcombinedCropped.ply ({len(cropped_points)} points)")
+    if args.output_bounded_colmap:
+        print(f"  - points3DColmapBounded.txt ({len(points_colmap_filtered)} points)")
+        print(f"  - points3DColmapBounded.ply ({len(points_colmap_filtered)} points)")
     print()
 
 

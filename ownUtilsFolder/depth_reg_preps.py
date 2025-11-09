@@ -97,8 +97,8 @@ def run_depth_anything_v2(images_dir, depth_output_dir):
     print("\nRUNNING DEPTH-ANYTHING-V2")
     print("-" * 70)
     
-    depth_script = "/mnt/data/tijaz/Depth-Anything-V2/metric_depth/run.py"
-    checkpoint_path = "/mnt/data/tijaz/Depth-Anything-V2/checkpoints/depth_anything_v2_metric_vkitti_vitl.pth"
+    depth_script = "/mnt/data/tijaz/Depth-Anything-V2/run.py"
+    checkpoint_path = "/mnt/data/tijaz/Depth-Anything-V2/checkpoints/depth_anything_v2_vitl.pth"
     
     # Verify script and checkpoint exist
     if not os.path.exists(depth_script):
